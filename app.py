@@ -18,34 +18,18 @@ app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
 # --- Globals & Cache ---
 BOT_USER_ID = app.client.auth_test()["user_id"]
 user_cache = {}
-# A dictionary to store the bonus users for each channel
-# Format: {'channel_id_1': {'user_id_a', 'user_id_b'}, 'channel_id_2': {'user_id_c', 'user_id_d'}}
 daily_bonus_users = {}
 
-def get_user_name(user_id):
-    """
-    Fetches a user's name from their ID, prioritizing real_name over display_name.
-    Uses a cache to reduce API calls.
-    """
-    if user_id in user_cache:
-        return user_cache[user_id]
-    try:
-        result = app.client.users_info(user=user_id)
-        # Prioritize real_name, then display_name, then username.
-        user_name = result['user']['profile'].get('real_name', result['user']['profile'].get('display_name', result['user']['name']))
-        user_cache[user_id] = user_name
-        return user_name
-    except Exception as e:
-        print(f"Error fetching user info for {user_id}: {e}")
-        # Return a non-pingable fallback name instead of a mention.
-        return f"User ({user_id})"
-
-# --- Season Calculation ---
+# --- Season Calculation (FIXED SCHEDULE) ---
+# The master schedule is now a fixed constant and will not be changed.
 SEASON_START_DATE = datetime(2025, 10, 9, 0, 0, 0, tzinfo=pytz.timezone('America/Los_Angeles'))
+# This dictionary will store the timestamp of the last manual reset for each channel.
+# Format: {"channel_id": datetime_object}
+manual_reset_timestamps = {}
 
 def get_current_season_id():
     """
-    Calculates the start date of the current season. Seasons are two weeks long.
+    Calculates the start date of the current season based on the FIXED anchor date.
     """
     now = datetime.now(pytz.timezone('America/Los_Angeles'))
     delta_days = (now - SEASON_START_DATE).days
@@ -53,16 +37,59 @@ def get_current_season_id():
     current_season_start = SEASON_START_DATE + timedelta(days=(seasons_passed * 14))
     return current_season_start.strftime('%Y-%m-%d')
 
-# --- Scheduled Job Functions ---
 
+# --- Reusable Season Logic ---
+def announce_season_winner(season_id_to_process, channel_id, is_manual_reset=False):
+    """
+    A helper function to find the winner for a given season and post announcements.
+    Can be used by both scheduled jobs and manual resets.
+    """
+    print(f"--- Announcing winner for season: {season_id_to_process} in channel {channel_id} ---")
+    try:
+        db_url = os.environ.get("DATABASE_URL")
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+
+        winner_query = """
+            SELECT spotter_id, SUM(spotter_points) AS total_score
+            FROM spots
+            WHERE season_id = %s AND channel_id = %s AND is_valid = TRUE
+            GROUP BY spotter_id
+            ORDER BY total_score DESC
+            LIMIT 1;
+        """
+        cur.execute(winner_query, (season_id_to_process, channel_id))
+        winner_result = cur.fetchone()
+
+        if is_manual_reset:
+            announcement = "✅ *Manual Reset Complete!*\n\n"
+        else:
+            announcement = f"🏆 A new Spotting Season has begun! 📸\n\n"
+
+        if winner_result:
+            winner_id, winner_score = winner_result
+            winner_name = get_user_name(winner_id)
+            period = "interim season" if is_manual_reset else "last season"
+            announcement += f"Congratulations to *{winner_name}* for winning the {period} with {int(winner_score)} spots!"
+        else:
+            announcement += "No spots were recorded in the last period. A fresh start!"
+        
+        app.client.chat_postMessage(channel=channel_id, text=announcement)
+        
+        cur.close()
+        conn.close()
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"🔴 Error in announce_season_winner: {error}")
+
+
+# --- Scheduled Job Functions ---
 def daily_bonus_job():
     """
     Selects two random users per active channel to be bonus targets for the day.
     """
     print("--- Running Daily Bonus Job ---")
-    global daily_bonus_users # Declare that we are modifying the global variable
-    
-    # Clear the previous day's bonus users
+    global daily_bonus_users
     daily_bonus_users.clear()
 
     try:
@@ -70,12 +97,10 @@ def daily_bonus_job():
         conn = psycopg2.connect(db_url)
         cur = conn.cursor()
 
-        # Get a list of all channels that have ever had a spot
         cur.execute("SELECT DISTINCT channel_id FROM spots")
         active_channels = [row[0] for row in cur.fetchall()]
 
         for channel_id in active_channels:
-            # For each channel, find all unique users who have ever participated
             cur.execute("""
                 SELECT spotter_id FROM spots WHERE channel_id = %s
                 UNION
@@ -85,11 +110,8 @@ def daily_bonus_job():
             participants = [row[0] for row in cur.fetchall()]
             
             if len(participants) >= 2:
-                # Select two unique users at random
                 bonus_targets = random.sample(participants, 2)
                 daily_bonus_users[channel_id] = set(bonus_targets)
-                
-                # Announce the bonus users in the channel
                 user1_name = get_user_name(bonus_targets[0])
                 user2_name = get_user_name(bonus_targets[1])
                 announcement = f"🎉 *Daily Bonus!* 🎉\nToday's bonus targets are *{user1_name}* and *{user2_name}*! Spots of them are worth 2 points!"
@@ -105,61 +127,41 @@ def daily_bonus_job():
 
 def end_of_season_job():
     """
-    This function runs at the end of a season. It finds the winner,
-    announces them in all relevant channels, and prepares for the new season.
+    Scheduled job that runs automatically. It determines the previous season and announces the winner.
     """
-    # This function is now correctly implemented based on previous iteration
-    print("--- Running End of Season Job ---")
+    print("--- Running Scheduled End of Season Job ---")
+    global manual_reset_timestamps
     
-    new_season_start_str = get_current_season_id()
-    new_season_start_dt = datetime.strptime(new_season_start_str, '%Y-%m-%d').astimezone(pytz.timezone('America/Los_Angeles'))
-    previous_season_start_dt = new_season_start_dt - timedelta(days=14)
+    current_season_start_str = get_current_season_id()
+    current_season_start_dt = datetime.strptime(current_season_start_str, '%Y-%m-%d').astimezone(pytz.timezone('America/Los_Angeles'))
+    previous_season_start_dt = current_season_start_dt - timedelta(days=14)
     previous_season_id = previous_season_start_dt.strftime('%Y-%m-%d')
-    print(f"--- Processing results for previous season: {previous_season_id} ---")
-
+    
     try:
         db_url = os.environ.get("DATABASE_URL")
         conn = psycopg2.connect(db_url)
         cur = conn.cursor()
-
         cur.execute("SELECT DISTINCT channel_id FROM spots WHERE season_id = %s", (previous_season_id,))
-        channels = cur.fetchall()
-
-        for channel_tuple in channels:
-            channel_id = channel_tuple[0]
-            
-            winner_query = """
-                SELECT spotter_id, SUM(points) AS total_score
-                FROM spots
-                WHERE season_id = %s AND channel_id = %s AND is_valid = TRUE
-                GROUP BY spotter_id
-                ORDER BY total_score DESC
-                LIMIT 1;
-            """
-            cur.execute(winner_query, (previous_season_id, channel_id))
-            winner_result = cur.fetchone()
-
-            announcement = f"🏆 A new Spotting Season has begun! 📸\n\n"
-            if winner_result:
-                winner_id, winner_score = winner_result
-                winner_name = get_user_name(winner_id)
-                announcement += f"Congratulations to *{winner_name}* for winning the last season with {int(winner_score)} spots!"
-            else:
-                announcement += "No spots were recorded in the last season. A fresh start!"
-            
-            app.client.chat_postMessage(channel=channel_id, text=announcement)
-        
+        channels = [row[0] for row in cur.fetchall()]
         cur.close()
         conn.close()
-        print("--- End of Season Job Finished ---")
+
+        for channel_id in channels:
+            announce_season_winner(previous_season_id, channel_id, is_manual_reset=False)
 
     except (Exception, psycopg2.DatabaseError) as error:
-        print(f"🔴 Error in end_of_season_job: {error}")
+        print(f"🔴 Error getting channels in end_of_season_job: {error}")
 
-# --- Database Setup ---
+    # Clear all manual resets for the new season
+    manual_reset_timestamps.clear()
+    print("--- Manual reset timestamps cleared for the new season. ---")
+    print("--- Scheduled End of Season Job Finished ---")
+
+
+# --- Database Setup & Other Listeners ---
 def setup_database():
     """
-    Connects to the database and creates the 'spots' table.
+    Connects to the database and creates the 'spots' table with separate point columns.
     """
     create_table_command = """
     CREATE TABLE IF NOT EXISTS spots (
@@ -169,7 +171,8 @@ def setup_database():
         channel_id TEXT NOT NULL,
         message_ts TEXT NOT NULL,
         image_url TEXT NOT NULL,
-        points INTEGER NOT NULL DEFAULT 1,
+        spotter_points INTEGER NOT NULL DEFAULT 1,
+        caught_points INTEGER NOT NULL DEFAULT 1,
         season_id TEXT NOT NULL,
         is_valid BOOLEAN NOT NULL DEFAULT TRUE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -194,7 +197,18 @@ def setup_database():
         if conn is not None:
             conn.close()
 
-# --- Bot Event Listeners ---
+def get_user_name(user_id):
+    if user_id in user_cache:
+        return user_cache[user_id]
+    try:
+        result = app.client.users_info(user=user_id)
+        user_name = result['user']['profile'].get('real_name', result['user']['profile'].get('display_name', result['user']['name']))
+        user_cache[user_id] = user_name
+        return user_name
+    except Exception as e:
+        print(f"Error fetching user info for {user_id}: {e}")
+        return f"User ({user_id})"
+
 def is_spot_message_and_not_command(message):
     text = message.get("text", "")
     has_keyword = re.search(r"\b(spot|spotted)\b", text, re.IGNORECASE)
@@ -203,9 +217,6 @@ def is_spot_message_and_not_command(message):
 
 @app.message(matchers=[is_spot_message_and_not_command])
 def handle_spot_message(message, say):
-    """
-    Core logic for handling a spot. Now awards bonus points.
-    """
     print("\n--- DEBUG: `handle_spot_message` was triggered. ---")
 
     if 'user' not in message or 'files' not in message or 'text' not in message:
@@ -213,7 +224,7 @@ def handle_spot_message(message, say):
 
     spotter_id = message['user']
     text = message['text']
-    channel_id = message['channel'] # Get channel ID
+    channel_id = message['channel']
     
     mentioned_users = set(re.findall(r"<@(\w+)>", text))
     if not mentioned_users:
@@ -229,14 +240,14 @@ def handle_spot_message(message, say):
             if spotter_id == spotted_id:
                 continue
             
-            points_to_award = 1
+            spotter_points_to_award = 1
             if channel_id in daily_bonus_users and spotted_id in daily_bonus_users[channel_id]:
-                points_to_award = 2
+                spotter_points_to_award = 2
                 print(f"--- DEBUG: Awarding 2 bonus points for spotting {spotted_id} in {channel_id}. ---")
 
             insert_command = """
-            INSERT INTO spots (spotter_id, spotted_id, channel_id, message_ts, image_url, season_id, points)
-            VALUES (%s, %s, %s, %s, %s, %s, %s);
+            INSERT INTO spots (spotter_id, spotted_id, channel_id, message_ts, image_url, season_id, spotter_points, caught_points)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
             """
             
             spot_data = (
@@ -246,7 +257,8 @@ def handle_spot_message(message, say):
                 message['ts'],
                 message['files'][0]['url_private'],
                 get_current_season_id(),
-                points_to_award
+                spotter_points_to_award,
+                1 # caught_points is always 1
             )
             
             cur.execute(insert_command, spot_data)
@@ -266,12 +278,8 @@ def handle_spot_message(message, say):
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 DEBUG: An error occurred during database operation: {error}")
 
-# **FIXED**: Using the subtype listener as a workaround for the UI bug.
 @app.event({"type": "message", "subtype": "message_deleted"})
 def handle_message_deletion(event):
-    """
-    Handles the deletion of a message by removing the corresponding spot from the database.
-    """
     print("\n--- DEBUG: `handle_message_deletion` (subtype) was triggered. ---")
     
     if 'previous_message' not in event or 'ts' not in event['previous_message']:
@@ -305,7 +313,7 @@ def handle_message_deletion(event):
 # --- Command Handlers and Listeners ---
 def handle_spotboard_command(message, say):
     """
-    Generates and posts the seasonal spotboard for the current channel.
+    Generates and posts the seasonal spotboard, respecting manual resets.
     """
     try:
         channel_id = message['channel']
@@ -316,28 +324,35 @@ def handle_spotboard_command(message, say):
         cur = conn.cursor()
 
         query = """
-            SELECT spotter_id, SUM(points) AS total_score
+            SELECT spotter_id, SUM(spotter_points) AS total_score
             FROM spots
             WHERE is_valid = TRUE AND season_id = %s AND channel_id = %s
+        """
+        params = [current_season, channel_id]
+
+        if channel_id in manual_reset_timestamps:
+            query += " AND created_at >= %s"
+            params.append(manual_reset_timestamps[channel_id])
+
+        query += """
             GROUP BY spotter_id
             ORDER BY total_score DESC
             LIMIT 5;
         """
-        cur.execute(query, (current_season, channel_id))
+
+        cur.execute(query, tuple(params))
         results = cur.fetchall()
         cur.close()
         conn.close()
 
         if not results:
-            say("No spots have been recorded in this channel this season yet!")
+            say("No spots have been recorded this season since the last reset!")
             return
 
         leaderboard_text = f"*Spotboard:*\n\n"
         for i, row in enumerate(results):
-            user_id, score = row
-            score = int(score)
-            user_name = get_user_name(user_id)
-            leaderboard_text += f"{i+1}. {user_name} - {score} spots\n"
+            user_id, score = row; score = int(score); user_name = get_user_name(user_id)
+            leaderboard_text += f"{i+1}. {user_name} - {score}\n"
         
         say(leaderboard_text)
 
@@ -347,7 +362,7 @@ def handle_spotboard_command(message, say):
 
 def handle_caughtboard_command(message, say):
     """
-    Generates and posts the seasonal caughtboard for the current channel.
+    Generates and posts the seasonal caughtboard, respecting manual resets.
     """
     try:
         channel_id = message['channel']
@@ -358,28 +373,35 @@ def handle_caughtboard_command(message, say):
         cur = conn.cursor()
 
         query = """
-            SELECT spotted_id, SUM(points) AS total_score
+            SELECT spotted_id, SUM(caught_points) AS total_score
             FROM spots
             WHERE is_valid = TRUE AND season_id = %s AND channel_id = %s
+        """
+        params = [current_season, channel_id]
+
+        if channel_id in manual_reset_timestamps:
+            query += " AND created_at >= %s"
+            params.append(manual_reset_timestamps[channel_id])
+
+        query += """
             GROUP BY spotted_id
             ORDER BY total_score DESC
             LIMIT 5;
         """
-        cur.execute(query, (current_season, channel_id))
+
+        cur.execute(query, tuple(params))
         results = cur.fetchall()
         cur.close()
         conn.close()
 
         if not results:
-            say("No one has been spotted in this channel this season yet!")
+            say("No one has been spotted this season since the last reset!")
             return
 
         leaderboard_text = f"*Caughtboard:*\n\n"
         for i, row in enumerate(results):
-            user_id, score = row
-            score = int(score)
-            user_name = get_user_name(user_id)
-            leaderboard_text += f"{i+1}. {user_name} - caught {score} times\n"
+            user_id, score = row; score = int(score); user_name = get_user_name(user_id)
+            leaderboard_text += f"{i+1}. {user_name} - {score}\n"
         
         say(leaderboard_text)
 
@@ -387,20 +409,14 @@ def handle_caughtboard_command(message, say):
         print(f"🔴 Error handling caughtboard command: {error}")
         say("Sorry, I had trouble fetching the caughtboard.")
 
-
 def handle_alltime_spotboard_command(message, say):
-    """
-    Generates and posts the all-time spotboard for the current channel.
-    """
     try:
         channel_id = message['channel']
-        
         db_url = os.environ.get("DATABASE_URL")
         conn = psycopg2.connect(db_url)
         cur = conn.cursor()
-
         query = """
-            SELECT spotter_id, SUM(points) AS total_score
+            SELECT spotter_id, SUM(spotter_points) AS total_score
             FROM spots
             WHERE is_valid = TRUE AND channel_id = %s
             GROUP BY spotter_id
@@ -411,38 +427,26 @@ def handle_alltime_spotboard_command(message, say):
         results = cur.fetchall()
         cur.close()
         conn.close()
-
         if not results:
             say("No spots have ever been recorded in this channel!")
             return
-
         leaderboard_text = f"*All-time Spotboard:*\n\n"
         for i, row in enumerate(results):
-            user_id, score = row
-            score = int(score)
-            user_name = get_user_name(user_id)
-            leaderboard_text += f"{i+1}. {user_name} - {score} spots\n"
-        
+            user_id, score = row; score = int(score); user_name = get_user_name(user_id)
+            leaderboard_text += f"{i+1}. {user_name} - {score}\n"
         say(leaderboard_text)
-
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error handling all-time spotboard command: {error}")
         say("Sorry, I had trouble fetching the all-time spotboard.")
 
 def handle_alltime_caughtboard_command(message, say):
-    """
-    Generates and posts the all-time caughtboard for the current channel.
-    """
     try:
         channel_id = message['channel']
-        
         db_url = os.environ.get("DATABASE_URL")
         conn = psycopg2.connect(db_url)
         cur = conn.cursor()
-
-        # Query for all-time caught scores
         query = """
-            SELECT spotted_id, SUM(points) AS total_score
+            SELECT spotted_id, SUM(caught_points) AS total_score
             FROM spots
             WHERE is_valid = TRUE AND channel_id = %s
             GROUP BY spotted_id
@@ -453,25 +457,111 @@ def handle_alltime_caughtboard_command(message, say):
         results = cur.fetchall()
         cur.close()
         conn.close()
-
         if not results:
             say("No one has ever been caught in this channel!")
             return
-
         leaderboard_text = f"*All-time Caughtboard:*\n\n"
         for i, row in enumerate(results):
-            user_id, score = row
-            score = int(score)
-            user_name = get_user_name(user_id)
-            leaderboard_text += f"{i+1}. {user_name} - caught {score} times\n"
-        
+            user_id, score = row; score = int(score); user_name = get_user_name(user_id)
+            leaderboard_text += f"{i+1}. {user_name} - {score}\n"
         say(leaderboard_text)
-
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error handling all-time caughtboard command: {error}")
         say("Sorry, I had trouble fetching the all-time caughtboard.")
 
-# --- Keyword Command Listeners ---
+def handle_miss_you_command(message, say):
+    """
+    Finds a random picture of a mentioned user and posts it.
+    """
+    try:
+        text = message.get('text', '')
+        mentioned_users = re.findall(r"<@(\w+)>", text)
+        
+        if not mentioned_users:
+            say("You need to tell me who you miss! Please mention a user, like `miss you @Rohan`.")
+            return
+
+        target_user_id = mentioned_users[0]
+        channel_id = message['channel']
+
+        db_url = os.environ.get("DATABASE_URL")
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+
+        query = "SELECT image_url FROM spots WHERE spotted_id = %s AND channel_id = %s AND is_valid = TRUE"
+        cur.execute(query, (target_user_id, channel_id))
+        
+        image_urls = [row[0] for row in cur.fetchall()]
+        
+        cur.close()
+        conn.close()
+
+        if not image_urls:
+            target_user_name = get_user_name(target_user_id)
+            say(f"Sorry, I couldn't find any pictures of {target_user_name} in this channel.")
+            return
+
+        random_image_url = random.choice(image_urls)
+        target_user_name = get_user_name(target_user_id)
+        
+        say(f"Missing them? Here's a memory of {target_user_name}!\n{random_image_url}")
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"🔴 Error handling 'miss you' command: {error}")
+        say("Sorry, I had a problem fetching that picture.")
+
+def handle_mystats_command(message, say):
+    """
+    Calculates and displays personal stats for the user who sent the command.
+    """
+    try:
+        user_id = message['user']
+        channel_id = message['channel']
+
+        db_url = os.environ.get("DATABASE_URL")
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+
+        # 1. Get total spots made by the user
+        cur.execute("SELECT SUM(spotter_points) FROM spots WHERE spotter_id = %s AND channel_id = %s AND is_valid = TRUE", (user_id, channel_id))
+        spots_made = cur.fetchone()[0] or 0
+
+        # 2. Get total times the user was caught
+        cur.execute("SELECT SUM(caught_points) FROM spots WHERE spotted_id = %s AND channel_id = %s AND is_valid = TRUE", (user_id, channel_id))
+        times_caught = cur.fetchone()[0] or 0
+
+        # 3. Get the user's most frequent target
+        cur.execute("""
+            SELECT spotted_id, COUNT(*) as spot_count
+            FROM spots
+            WHERE spotter_id = %s AND channel_id = %s AND is_valid = TRUE
+            GROUP BY spotted_id
+            ORDER BY spot_count DESC
+            LIMIT 1;
+        """, (user_id, channel_id))
+        nemesis_result = cur.fetchone()
+
+        cur.close()
+        conn.close()
+
+        user_name = get_user_name(user_id)
+        stats_text = f"📊 *{user_name}'s Spotting Record in this channel:*\n\n"
+        stats_text += f"• You have spotted others *{int(spots_made)}* times.\n"
+        stats_text += f"• You have been spotted *{int(times_caught)}* times.\n"
+
+        if nemesis_result:
+            nemesis_id, nemesis_count = nemesis_result
+            nemesis_name = get_user_name(nemesis_id)
+            stats_text += f"• Your most frequent target is *{nemesis_name}* ({nemesis_count} spots)."
+        else:
+            stats_text += "• You haven't spotted anyone yet!"
+
+        say(stats_text)
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"🔴 Error handling mystats command: {error}")
+        say("Sorry, I had trouble fetching your stats.")
+
 
 @app.message(re.compile(r"^spotboard$", re.IGNORECASE))
 def handle_spotboard_keyword(message, say):
@@ -488,6 +578,62 @@ def handle_alltime_spotboard_keyword(message, say):
 @app.message(re.compile(r"^(alltimecaughtboard|all time caught board)$", re.IGNORECASE))
 def handle_alltime_caughtboard_keyword(message, say):
     handle_alltime_caughtboard_command(message, say)
+    
+@app.message(re.compile(r"^reset$", re.IGNORECASE))
+def handle_reset_request(message, client):
+    try:
+        client.chat_postEphemeral(
+            channel=message['channel'],
+            user=message['user'],
+            text="Are you sure you want to reset the seasonal leaderboards? This cannot be undone.",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "Are you sure you want to reset the seasonal leaderboards? This will announce the winner of the current interim season and start a fresh board."}}, {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "Confirm Reset"}, "style": "danger", "action_id": "confirm_reset_action"}, {"type": "button", "text": {"type": "plain_text", "text": "Cancel"}, "action_id": "cancel_reset_action"}]}]
+        )
+    except Exception as e:
+        print(f"🔴 Error sending reset confirmation: {e}")
+
+@app.message(re.compile(r"^(i miss (you|u)|miss (you|u))", re.IGNORECASE))
+def handle_miss_you_keyword(message, say):
+    handle_miss_you_command(message, say)
+
+@app.message(re.compile(r"^mystats$", re.IGNORECASE))
+def handle_mystats_keyword(message, say):
+    handle_mystats_command(message, say)
+
+# --- Action (Button Click) Listeners ---
+@app.action("confirm_reset_action")
+def handle_confirm_reset_action(ack, body, client):
+    """
+    Handles the confirmation of a manual season reset.
+    Announces the winner of the interim period and sets a new reset timestamp.
+    """
+    ack()
+    global manual_reset_timestamps
+
+    try:
+        channel_id = body['channel']['id']
+        season_to_end_id = get_current_season_id()
+        announce_season_winner(season_to_end_id, channel_id, is_manual_reset=True)
+        
+        manual_reset_timestamps[channel_id] = datetime.now(pytz.timezone('America/Los_Angeles'))
+        print(f"--- MANUAL RESET: Reset timestamp set for channel {channel_id} ---")
+
+        client.chat_delete(
+            channel=body['channel']['id'],
+            ts=body['message']['ts']
+        )
+    except Exception as e:
+        print(f"🔴 Error in confirm_reset_action: {e}")
+
+@app.action("cancel_reset_action")
+def handle_cancel_reset_action(ack, body, client):
+    ack()
+    try:
+        client.chat_delete(
+            channel=body['channel']['id'],
+            ts=body['message']['ts']
+        )
+    except Exception as e:
+        print(f"🔴 Error in cancel_reset_action: {e}")
 
 @app.event("app_mention")
 def handle_mention(event, say):
@@ -495,8 +641,12 @@ def handle_mention(event, say):
     Handles leaderboard commands when the bot is @-mentioned.
     """
     command_text = event['text'].strip().lower()
-
-    if "alltimecaughtboard" in command_text or "all time caught board" in command_text:
+    
+    if "mystats" in command_text:
+        handle_mystats_command(event, say)
+    elif "miss" in command_text:
+        handle_miss_you_command(event, say)
+    elif "alltimecaughtboard" in command_text or "all time caught board" in command_text:
         handle_alltime_caughtboard_command(event, say)
     elif "alltimespotboard" in command_text or "all time spot board" in command_text:
         handle_alltime_spotboard_command(event, say)
@@ -504,6 +654,9 @@ def handle_mention(event, say):
         handle_caughtboard_command(event, say)
     elif "spotboard" in command_text:
         handle_spotboard_command(event, say)
+    elif "test bonus" in command_text:
+        say("Sure, I'll run the daily bonus job for you right now. Check the channel for an announcement if it's eligible.")
+        daily_bonus_job()
     else:
         say(f"Hi there, <@{event['user']}>! Try one of our leaderboard commands: `spotboard`, `caughtboard`, `alltimespotboard`, or `alltimecaughtboard`.")
 
@@ -514,7 +667,6 @@ if __name__ == "__main__":
     
     scheduler = BackgroundScheduler(timezone=pytz.timezone('America/Los_Angeles'))
     
-    # Schedule the end of season job
     scheduler.add_job(
         end_of_season_job, 
         'cron', 
@@ -525,7 +677,6 @@ if __name__ == "__main__":
         start_date='2025-10-09 00:00:00'
     )
     
-    # **NEW**: Schedule the daily bonus job
     scheduler.add_job(
         daily_bonus_job,
         'cron',
