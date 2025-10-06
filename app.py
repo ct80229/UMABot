@@ -3,11 +3,14 @@ import re
 import psycopg2
 import pytz
 import random # Import the random module
+import requests
+import io
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from apscheduler.schedulers.background import BackgroundScheduler
+from PIL import Image
 
 # Load environment variables from .env file
 load_dotenv()
@@ -19,6 +22,8 @@ app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
 BOT_USER_ID = app.client.auth_test()["user_id"]
 user_cache = {}
 daily_bonus_users = {}
+# The explosion images are now loaded from a local directory
+EXPLOSIONS_DIR = "explosions" 
 
 # --- Season Calculation (FIXED SCHEDULE) ---
 # The master schedule is now a fixed constant and will not be changed.
@@ -562,6 +567,82 @@ def handle_mystats_command(message, say):
         print(f"🔴 Error handling mystats command: {error}")
         say("Sorry, I had trouble fetching your stats.")
 
+def handle_explode_command(message, say, client):
+    """
+    Finds a random picture of a user, overlays a random explosion, and uploads it.
+    """
+    try:
+        text = message.get('text', '')
+        mentioned_users = re.findall(r"<@(\w+)>", text)
+        
+        if not mentioned_users:
+            say("You need to tell me who to explode! Please mention a user, like `explode @Rohan`.")
+            return
+
+        target_user_id = mentioned_users[0]
+        channel_id = message['channel']
+
+        # 1. Find a random image URL from the database
+        db_url = os.environ.get("DATABASE_URL")
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+        query = "SELECT image_url FROM spots WHERE spotted_id = %s AND channel_id = %s AND is_valid = TRUE"
+        cur.execute(query, (target_user_id, channel_id))
+        image_urls = [row[0] for row in cur.fetchall()]
+        cur.close()
+        conn.close()
+
+        if not image_urls:
+            target_user_name = get_user_name(target_user_id)
+            say(f"Sorry, I couldn't find any pictures of {target_user_name} to explode.")
+            return
+
+        random_image_url = random.choice(image_urls)
+        
+        # 2. Download the user image and select a random local explosion image
+        auth_header = {"Authorization": f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"}
+        user_image_response = requests.get(random_image_url, headers=auth_header)
+        user_image_response.raise_for_status()
+
+        try:
+            explosion_files = [f for f in os.listdir(EXPLOSIONS_DIR) if f.lower().endswith('.png')]
+            if not explosion_files:
+                say("I couldn't find any explosion images in my folder!")
+                return
+            random_explosion_path = os.path.join(EXPLOSIONS_DIR, random.choice(explosion_files))
+        except FileNotFoundError:
+            print(f"🔴 Error: The directory '{EXPLOSIONS_DIR}' was not found.")
+            say("I'm having trouble finding my explosion effects. Please check my configuration.")
+            return
+
+        # 3. Process the images with Pillow
+        base_image = Image.open(io.BytesIO(user_image_response.content)).convert("RGBA")
+        explosion_image = Image.open(random_explosion_path).convert("RGBA")
+
+        # Resize explosion to match the base image size
+        explosion_image = explosion_image.resize(base_image.size)
+
+        # Composite the images
+        composite_image = Image.alpha_composite(base_image, explosion_image)
+        
+        # Save the result to a temporary in-memory file
+        temp_file = io.BytesIO()
+        composite_image.save(temp_file, format='PNG')
+        temp_file.seek(0)
+
+        # 4. Upload the new image to Slack
+        target_user_name = get_user_name(target_user_id)
+        client.files_upload_v2(
+            channel=channel_id,
+            initial_comment=f"💥 {target_user_name} has been exploded! 💥",
+            file=temp_file,
+            filename="explosion.png"
+        )
+
+    except Exception as e:
+        print(f"🔴 Error in explode command: {e}")
+        say("Sorry, I had trouble creating the explosion. The image might be too powerful.")
+
 
 @app.message(re.compile(r"^spotboard$", re.IGNORECASE))
 def handle_spotboard_keyword(message, say):
@@ -598,6 +679,10 @@ def handle_miss_you_keyword(message, say):
 @app.message(re.compile(r"^mystats$", re.IGNORECASE))
 def handle_mystats_keyword(message, say):
     handle_mystats_command(message, say)
+    
+@app.message(re.compile(r"^explode", re.IGNORECASE))
+def handle_explode_keyword(message, say, client):
+    handle_explode_command(message, say, client)
 
 # --- Action (Button Click) Listeners ---
 @app.action("confirm_reset_action")
@@ -636,13 +721,15 @@ def handle_cancel_reset_action(ack, body, client):
         print(f"🔴 Error in cancel_reset_action: {e}")
 
 @app.event("app_mention")
-def handle_mention(event, say):
+def handle_mention(event, say, client):
     """
     Handles leaderboard commands when the bot is @-mentioned.
     """
     command_text = event['text'].strip().lower()
     
-    if "mystats" in command_text:
+    if "explode" in command_text:
+        handle_explode_command(event, say, client)
+    elif "mystats" in command_text:
         handle_mystats_command(event, say)
     elif "miss" in command_text:
         handle_miss_you_command(event, say)
