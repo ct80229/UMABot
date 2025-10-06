@@ -229,13 +229,11 @@ def handle_spot_message(message, say):
             if spotter_id == spotted_id:
                 continue
             
-            # **NEW**: Check for bonus points
             points_to_award = 1
             if channel_id in daily_bonus_users and spotted_id in daily_bonus_users[channel_id]:
                 points_to_award = 2
                 print(f"--- DEBUG: Awarding 2 bonus points for spotting {spotted_id} in {channel_id}. ---")
 
-            # **UPDATED**: The INSERT command now includes the points column
             insert_command = """
             INSERT INTO spots (spotter_id, spotted_id, channel_id, message_ts, image_url, season_id, points)
             VALUES (%s, %s, %s, %s, %s, %s, %s);
@@ -248,7 +246,7 @@ def handle_spot_message(message, say):
                 message['ts'],
                 message['files'][0]['url_private'],
                 get_current_season_id(),
-                points_to_award # Pass the points value
+                points_to_award
             )
             
             cur.execute(insert_command, spot_data)
@@ -267,6 +265,42 @@ def handle_spot_message(message, say):
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 DEBUG: An error occurred during database operation: {error}")
+
+# **FIXED**: Using the subtype listener as a workaround for the UI bug.
+@app.event({"type": "message", "subtype": "message_deleted"})
+def handle_message_deletion(event):
+    """
+    Handles the deletion of a message by removing the corresponding spot from the database.
+    """
+    print("\n--- DEBUG: `handle_message_deletion` (subtype) was triggered. ---")
+    
+    if 'previous_message' not in event or 'ts' not in event['previous_message']:
+        print("--- DEBUG: No previous_message or ts found in deletion event. Skipping. ---")
+        return
+
+    deleted_ts = event['previous_message']['ts']
+    print(f"--- DEBUG: A message with timestamp {deleted_ts} was deleted. Checking database. ---")
+
+    try:
+        db_url = os.environ.get("DATABASE_URL")
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+
+        delete_command = "DELETE FROM spots WHERE message_ts = %s"
+        
+        cur.execute(delete_command, (deleted_ts,))
+        
+        if cur.rowcount > 0:
+            print(f"--- SUCCESS: Deleted {cur.rowcount} spot record(s) with timestamp {deleted_ts}. ---")
+        else:
+            print(f"--- INFO: Deleted message {deleted_ts} was not a spot record. No action taken. ---")
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"🔴 DEBUG: An error occurred during message deletion handling: {error}")
 
 # --- Command Handlers and Listeners ---
 def handle_spotboard_command(message, say):
