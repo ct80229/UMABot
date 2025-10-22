@@ -1200,7 +1200,7 @@ def handle_spot_help_command(message, say):
 • `caughtboard`: Show the seasonal leaderboard of most spotted players.
 • `alltimespotboard`: Show the all-time leaderboard of top spotters.
 • `alltimecaughtboard`: Show the all-time leaderboard of most spotted players.
-• `reset`: Manually end the current season and start a new one (requires confirmation).
+• `reset`: Manually end the current season and start a new one (admin only).
 • `miss you @user` or `i miss u @user`: Shows a random past spot picture of the mentioned user.
 • `mystats`: Shows your personal spotting stats in this channel.
 • `explode @user`: Overlays a random explosion on a random spot picture of the mentioned user.
@@ -1230,6 +1230,15 @@ def handle_alltime_caughtboard_keyword(message, say):
 
 @app.message(re.compile(r"^reset$", re.IGNORECASE))
 def handle_reset_request(message, client):
+    # --- ADMIN CHECK ---
+    if message['user'] != ADMIN_USER_ID:
+        client.chat_postEphemeral(
+            channel=message['channel'],
+            user=message['user'],
+            text="Sorry, only the designated admin can reset the Spot Bot season."
+        )
+        return
+    # --- END ADMIN CHECK ---
     try:
         client.chat_postEphemeral(
             channel=message['channel'],
