@@ -1213,7 +1213,7 @@ _Admin commands (`assassin start`, `assassin end`, `assassin targets`) are restr
 def handle_spot_help_command(message, say):
     """Displays the help message for the Spot Bot game."""
     help_text = """
-*Spot Bot Commands:*
+*UMBot Commands:*
 • `spot @user` or `spotted @user` (with image): Record a spot. Counts for 1 point (or 2 for daily bonus targets!).
 • `spotboard`: Show the seasonal leaderboard of top spotters.
 • `caughtboard`: Show the seasonal leaderboard of most spotted players.
@@ -1237,7 +1237,7 @@ def handle_daily_bonus_command(message, say):
         user2_name = get_user_name(targets[1])
         say(f"Today's bonus targets are *{user1_name}* and *{user2_name}*! Spots of them are worth 2 points.")
     else:
-        say("Bonus targets haven't been assigned for today yet, or this channel isn't active in the Spot Bot game.")
+        say("Bonus targets haven't been assigned for today yet.")
 
 
 # --- Keyword Listeners ---
