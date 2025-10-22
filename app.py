@@ -100,7 +100,7 @@ def daily_bonus_job():
     """
     print("--- Running Daily Bonus Job ---")
     global daily_bonus_users
-    daily_bonus_users.clear()
+    daily_bonus_users.clear() # Clear previous day's targets globally
 
     conn = None
     cur = None
@@ -111,25 +111,41 @@ def daily_bonus_job():
 
         cur.execute("SELECT DISTINCT channel_id FROM spots")
         active_channels = [row[0] for row in cur.fetchall()]
+        print(f"--- Found active channels for bonus job: {active_channels} ---")
+
+        new_bonus_assignments = {} # Use a temporary dict to build the new assignments
 
         for channel_id in active_channels:
             cur.execute("""
-                SELECT spotter_id FROM spots WHERE channel_id = %s
-                UNION
-                SELECT spotted_id FROM spots WHERE channel_id = %s
+                SELECT DISTINCT user_id FROM (
+                    SELECT spotter_id as user_id FROM spots WHERE channel_id = %s
+                    UNION
+                    SELECT spotted_id as user_id FROM spots WHERE channel_id = %s
+                ) as participants
             """, (channel_id, channel_id))
 
             participants = [row[0] for row in cur.fetchall()]
+            print(f"--- Found participants for channel {channel_id}: {participants} ---")
+
 
             if len(participants) >= 2:
                 bonus_targets = random.sample(participants, 2)
-                daily_bonus_users[channel_id] = set(bonus_targets)
+                # Store in the temporary dictionary
+                new_bonus_assignments[channel_id] = set(bonus_targets)
+
                 user1_name = get_user_name(bonus_targets[0])
                 user2_name = get_user_name(bonus_targets[1])
                 announcement = f"🎉 *Daily Bonus!* 🎉\nToday's bonus targets are *{user1_name}* and *{user2_name}*! Spots of them are worth 2 points!"
-                app.client.chat_postMessage(channel=channel_id, text=announcement)
-                print(f"--- Bonus users for channel {channel_id}: {bonus_targets} ---")
+                try:
+                    app.client.chat_postMessage(channel=channel_id, text=announcement)
+                    print(f"--- Bonus users announced for channel {channel_id}: {bonus_targets} ---")
+                except Exception as api_error:
+                    print(f"🔴 Error posting bonus announcement to {channel_id}: {api_error}")
+            else:
+                 print(f"--- Not enough participants in channel {channel_id} to assign bonus targets. ---")
 
+        # Atomically update the global variable
+        daily_bonus_users = new_bonus_assignments
         print("--- Daily Bonus Job Finished ---")
 
     except (Exception, psycopg2.DatabaseError) as error:
@@ -139,6 +155,7 @@ def daily_bonus_job():
              cur.close()
         if conn is not None:
              conn.close()
+
 
 def end_of_season_job():
     """
@@ -295,7 +312,8 @@ def handle_spot_message(message, say):
                 continue
 
             spotter_points_to_award = 1
-            if channel_id in daily_bonus_users and spotted_id in daily_bonus_users[channel_id]:
+            # Check the global dict for bonus points
+            if channel_id in daily_bonus_users and spotted_id in daily_bonus_users.get(channel_id, set()):
                 spotter_points_to_award = 2
                 print(f"--- DEBUG: Awarding 2 bonus points for spotting {spotted_id} in {channel_id}. ---")
 
@@ -1188,6 +1206,7 @@ def handle_assassin_help_command(message, say):
 • `assassin alive`: Shows a list of players still in the game.
 • `assassin dead`: Shows a list of eliminated players.
 • `assassin killcount`: Displays the top 3 players by number of eliminations.
+_Admin commands (`assassin start`, `assassin end`, `assassin targets`) are restricted._
 """
     say(help_text)
 
@@ -1204,9 +1223,21 @@ def handle_spot_help_command(message, say):
 • `miss you @user` or `i miss u @user`: Shows a random past spot picture of the mentioned user.
 • `mystats`: Shows your personal spotting stats in this channel.
 • `explode @user`: Overlays a random explosion on a random spot picture of the mentioned user.
+• `dailybonus`: Shows who the current daily bonus targets are.
 • `assassin help`: Show commands for the Assassin game.
 """
     say(help_text)
+
+def handle_daily_bonus_command(message, say):
+    """Displays the current daily bonus targets for the channel."""
+    channel_id = message['channel']
+    if channel_id in daily_bonus_users and daily_bonus_users[channel_id]:
+        targets = list(daily_bonus_users[channel_id])
+        user1_name = get_user_name(targets[0])
+        user2_name = get_user_name(targets[1])
+        say(f"Today's bonus targets are *{user1_name}* and *{user2_name}*! Spots of them are worth 2 points.")
+    else:
+        say("Bonus targets haven't been assigned for today yet, or this channel isn't active in the Spot Bot game.")
 
 
 # --- Keyword Listeners ---
@@ -1264,6 +1295,10 @@ def handle_explode_keyword(message, say, client):
 @app.message(re.compile(r"^help$", re.IGNORECASE))
 def handle_spot_help_keyword(message, say):
     handle_spot_help_command(message, say)
+
+@app.message(re.compile(r"^dailybonus$", re.IGNORECASE))
+def handle_daily_bonus_keyword(message, say):
+    handle_daily_bonus_command(message, say)
 
 # Assassin Game Keyword Listeners
 @app.message(re.compile(r"^assassin start", re.IGNORECASE))
@@ -1458,6 +1493,8 @@ def handle_mention(event, say, client):
     elif command_part == "test bonus":
         say("Sure, I'll run the daily bonus job for you right now. Check the channel for an announcement if it's eligible.")
         daily_bonus_job()
+    elif command_part == "dailybonus": # New command
+        handle_daily_bonus_command(event, say)
     elif command_part == "help" or command_part == "": # Check for just "help" or only the mention
         handle_spot_help_command(event, say)
     else: # Default fallback if no other command matches
