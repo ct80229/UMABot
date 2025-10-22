@@ -166,9 +166,9 @@ def end_of_season_job():
 # --- Database Setup & Other Listeners ---
 def setup_database():
     """
-    Connects to the database and creates the 'spots' table with separate point columns.
+    Connects to the database and creates all necessary tables for both games.
     """
-    create_table_command = """
+    spots_table_command = """
     CREATE TABLE IF NOT EXISTS spots (
         id SERIAL PRIMARY KEY,
         spotter_id TEXT NOT NULL,
@@ -184,6 +184,26 @@ def setup_database():
         UNIQUE (message_ts, spotted_id)
     );
     """
+    assassin_players_table_command = """
+    CREATE TABLE IF NOT EXISTS assassin_players (
+        id SERIAL PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        player_id TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        kill_count INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """
+    assassin_eliminations_table_command = """
+    CREATE TABLE IF NOT EXISTS assassin_eliminations (
+        id SERIAL PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        killer_id TEXT NOT NULL,
+        victim_id TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """
     conn = None
     try:
         db_url = os.environ.get("DATABASE_URL")
@@ -192,10 +212,12 @@ def setup_database():
             return
         conn = psycopg2.connect(db_url)
         cur = conn.cursor()
-        cur.execute(create_table_command)
+        cur.execute(spots_table_command)
+        cur.execute(assassin_players_table_command)
+        cur.execute(assassin_eliminations_table_command)
         conn.commit()
         cur.close()
-        print("✅ Database table 'spots' is ready.")
+        print("✅ All database tables are ready.")
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error while connecting to PostgreSQL: {error}")
     finally:
@@ -213,6 +235,8 @@ def get_user_name(user_id):
     except Exception as e:
         print(f"Error fetching user info for {user_id}: {e}")
         return f"User ({user_id})"
+
+# ... (Existing Spot Bot listeners: is_spot_message_and_not_command, handle_spot_message, handle_message_deletion)
 
 def is_spot_message_and_not_command(message):
     text = message.get("text", "")
@@ -315,7 +339,9 @@ def handle_message_deletion(event):
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 DEBUG: An error occurred during message deletion handling: {error}")
 
-# --- Command Handlers and Listeners ---
+# --- Command Handlers and Listeners (Spot Bot) ---
+# ... (All your existing spotboard, caughtboard, miss you, etc. handlers)
+
 def handle_spotboard_command(message, say):
     """
     Generates and posts the seasonal spotboard, respecting manual resets.
@@ -643,7 +669,376 @@ def handle_explode_command(message, say, client):
         print(f"🔴 Error in explode command: {e}")
         say("Sorry, I had trouble creating the explosion. The image might be too powerful.")
 
+# --- Assassin Game Command Handlers ---
 
+def handle_assassin_start_command(message, say, client):
+    """
+    Starts a new game of Assassin in the current channel.
+    """
+    channel_id = message['channel']
+    starter_id = message['user']
+    text = message.get('text', '')
+    
+    try:
+        db_url = os.environ.get("DATABASE_URL")
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+
+        # 1. Check if a game is already running in this channel
+        cur.execute("SELECT COUNT(*) FROM assassin_players WHERE channel_id = %s AND is_active = TRUE", (channel_id,))
+        active_game_count = cur.fetchone()[0]
+        if active_game_count > 0:
+            print(active_game_count)
+            cur.close()
+            conn.close()
+            return
+
+        # 2. Gather players
+        mentioned_users = list(set(re.findall(r"<@(\w+)>", text)))
+        if len(mentioned_users) < 3:
+            say("You need at least 3 players to start a game of Assassin. Please mention everyone who is playing.")
+            cur.close()
+            conn.close()
+            return
+        
+        # 3. Clear old game data for the channel and shuffle players
+        cur.execute("DELETE FROM assassin_players WHERE channel_id = %s", (channel_id,))
+        cur.execute("DELETE FROM assassin_eliminations WHERE channel_id = %s", (channel_id,))
+        
+        players = mentioned_users
+        random.shuffle(players)
+
+        # 4. Assign targets and insert into database
+        for i, player_id in enumerate(players):
+            target_id = players[(i + 1) % len(players)] # The next player in the shuffled list
+            cur.execute(
+                "INSERT INTO assassin_players (channel_id, player_id, target_id) VALUES (%s, %s, %s)",
+                (channel_id, player_id, target_id)
+            )
+        
+        conn.commit()
+        
+        # 5. Announce the game start and notify players of their targets privately
+        player_names = ", ".join([f"<@{p}>" for p in players])
+        say(f"A new game of Assassin has begun!\n*Players:* {player_names}\nEach player has been sent their first target privately. Good luck!")
+
+        # --- DEBUGGING START ---
+        print(f"--- Attempting to send targets for channel {channel_id} ---")
+        for player_id in players:
+            try:
+                cur.execute("SELECT target_id FROM assassin_players WHERE player_id = %s AND channel_id = %s", (player_id, channel_id))
+                target_id_result = cur.fetchone()
+                if not target_id_result:
+                    print(f"🔴 DEBUG: Could not find target_id for player {player_id} in DB.")
+                    continue # Skip this player if DB fetch failed
+
+                target_id = target_id_result[0]
+                target_name = get_user_name(target_id)
+                print(f"--- DEBUG: Preparing to notify player {player_id} ({get_user_name(player_id)}) their target is {target_id} ({target_name}) ---")
+
+                client.chat_postEphemeral(
+                    channel=channel_id,
+                    user=player_id,
+                    text=f"Your first target is: *{target_name}*."
+                )
+                print(f"--- DEBUG: Successfully sent ephemeral message to {player_id} ---")
+            except Exception as e:
+                # Catch errors specifically within the loop
+                print(f"🔴 DEBUG: Error sending ephemeral message to {player_id}: {e}")
+        # --- DEBUGGING END ---
+
+        cur.close()
+        conn.close()
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"🔴 Error in assassin_start_command: {error}")
+        say("Sorry, I ran into an error trying to start the game.")
+    finally:
+        # Ensure connection is closed even if errors occur before explicit close
+        if 'conn' in locals() and conn is not None:
+             if not conn.closed:
+                  cur.close()
+                  conn.close()
+
+def handle_assassin_target_command(message, say, client):
+    """
+    Privately tells a player who their current target is.
+    """
+    channel_id = message['channel']
+    player_id = message['user']
+
+    try:
+        db_url = os.environ.get("DATABASE_URL")
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+
+        cur.execute("SELECT target_id, is_active FROM assassin_players WHERE player_id = %s AND channel_id = %s", (player_id, channel_id))
+        result = cur.fetchone()
+
+        if not result:
+            client.chat_postEphemeral(channel=channel_id, user=player_id, text="You are not currently in a game of Assassin in this channel.")
+            return
+
+        target_id, is_active = result
+        if not is_active:
+            client.chat_postEphemeral(channel=channel_id, user=player_id, text="You have been eliminated from the game!")
+            return
+
+        target_name = get_user_name(target_id)
+        client.chat_postEphemeral(channel=channel_id, user=player_id, text=f"Your current target is: *{target_name}*.")
+        
+        cur.close()
+        conn.close()
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"🔴 Error in assassin_target_command: {error}")
+        client.chat_postEphemeral(channel=channel_id, user=player_id, text="Sorry, I had a problem fetching your target.")
+
+def handle_eliminated_command(message, say, client):
+    """
+    Handles a player's attempt to eliminate their target.
+    """
+    print(f"\n--- DEBUG: handle_eliminated_command triggered by message: {message.get('text', '')[:50]} ---")
+    print(f"--- DEBUG: Message user: {message.get('user')}, Bot ID: {BOT_USER_ID}, Message has bot_id: {'bot_id' in message} ---")
+
+    # --- FIX START ---
+    # More robust check: Ignore messages sent by the bot itself OR any other bot
+    if message.get('user') == BOT_USER_ID or message.get('bot_id') is not None:
+        print("--- DEBUG: Ignoring message from self or another bot in handle_eliminated_command ---")
+        return
+    # --- FIX END ---
+    
+    channel_id = message['channel']
+    # Ensure 'user' exists before using it, though the check above should handle most cases
+    killer_id = message.get('user') 
+    if not killer_id:
+        print("--- DEBUG: Message missing 'user' field in handle_eliminated_command. Skipping. ---")
+        return # Cannot process if we don't know who sent it
+
+    text = message.get('text', '')
+
+    # 1. Basic Validation
+    if 'files' not in message:
+        say("An elimination attempt requires photo or video proof!")
+        return
+        
+    mentioned_users = re.findall(r"<@(\w+)>", text)
+    if not mentioned_users:
+        say("You must mention the player you are eliminating.")
+        return
+    victim_id = mentioned_users[0]
+
+    conn = None # Initialize outside try
+    cur = None # Initialize outside try
+    try:
+        conn = psycopg2.connect(os.environ.get("DATABASE_URL"))
+        cur = conn.cursor()
+
+        # 2. Advanced Validation
+        cur.execute("SELECT target_id, is_active FROM assassin_players WHERE player_id = %s AND channel_id = %s", (killer_id, channel_id))
+        killer_data = cur.fetchone()
+
+        # This check should now only run for actual user messages
+        if not killer_data:
+            say("You are not a player in the current game.")
+            return
+        
+        killer_target, killer_is_active = killer_data
+        if not killer_is_active:
+            say("You can't eliminate someone when you've already been eliminated!")
+            return
+
+        if killer_target != victim_id:
+            say("That is not your target!")
+            return
+
+        # Check if victim exists and is active
+        cur.execute("SELECT target_id, is_active FROM assassin_players WHERE player_id = %s AND channel_id = %s", (victim_id, channel_id))
+        victim_data = cur.fetchone()
+        if not victim_data or not victim_data[1]: # If victim doesn't exist or is already inactive
+             say("Your target has already been eliminated.")
+             return
+
+        # 3. Process the elimination
+        new_target_id = victim_data[0] # Get the victim's target
+
+        # Update victim's status
+        cur.execute("UPDATE assassin_players SET is_active = FALSE WHERE player_id = %s AND channel_id = %s", (victim_id, channel_id))
+        
+        # Update killer's status
+        cur.execute("UPDATE assassin_players SET target_id = %s, kill_count = kill_count + 1 WHERE player_id = %s AND channel_id = %s", (new_target_id, killer_id, channel_id))
+
+        # Log the elimination
+        cur.execute("INSERT INTO assassin_eliminations (channel_id, killer_id, victim_id) VALUES (%s, %s, %s)", (channel_id, killer_id, victim_id))
+
+        conn.commit()
+
+        # 4. Check for a winner
+        cur.execute("SELECT player_id FROM assassin_players WHERE channel_id = %s AND is_active = TRUE", (channel_id,))
+        active_players = cur.fetchall()
+
+        killer_name = get_user_name(killer_id)
+        victim_name = get_user_name(victim_id)
+
+        if len(active_players) == 1:
+            winner_id = active_players[0][0]
+            winner_name = get_user_name(winner_id)
+            say(f"💥 *{killer_name}* has eliminated *{victim_name}*! 💥\n\n🏆 The game is over! Congratulations to the winner, *{winner_name}*! 🏆")
+            # Clear the game board - Consider just marking as inactive? For now, deleting.
+            cur.execute("DELETE FROM assassin_players WHERE channel_id = %s", (channel_id,))
+            conn.commit()
+        else:
+            # Announce elimination and notify killer of new target
+            say(f"💥 *{killer_name}* has eliminated *{victim_name}*! 💥")
+            new_target_name = get_user_name(new_target_id)
+            client.chat_postEphemeral(
+                channel=channel_id,
+                user=killer_id,
+                text=f"Congratulations on the elimination! Your new target is: *{new_target_name}*."
+            )
+        
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"🔴 Error in eliminated_command: {error}")
+        say("Sorry, I encountered an error while processing the elimination.")
+    finally:
+        # Ensure connection is closed even if errors occur before explicit close
+        if cur is not None:
+             cur.close()
+        if conn is not None:
+             conn.close()
+
+
+def handle_assassin_alive_command(message, say):
+    """Lists the players currently active in the Assassin game."""
+    channel_id = message['channel']
+    try:
+        conn = psycopg2.connect(os.environ.get("DATABASE_URL"))
+        cur = conn.cursor()
+        cur.execute("SELECT player_id FROM assassin_players WHERE channel_id = %s AND is_active = TRUE ORDER BY created_at", (channel_id,))
+        active_players_ids = [row[0] for row in cur.fetchall()]
+        cur.close()
+        conn.close()
+
+        if not active_players_ids:
+            say("No game is currently active, or everyone has been eliminated!")
+            return
+        
+        alive_list = "\n".join([f"• {get_user_name(pid)}" for pid in active_players_ids])
+        say(f"Players still alive:\n{alive_list}")
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"🔴 Error in assassin_alive_command: {error}")
+        say("Sorry, I couldn't fetch the list of active players.")
+
+def handle_assassin_dead_command(message, say):
+    """Lists the players who have been eliminated from the Assassin game."""
+    channel_id = message['channel']
+    try:
+        conn = psycopg2.connect(os.environ.get("DATABASE_URL"))
+        cur = conn.cursor()
+        # Fetching eliminated players along with who eliminated them and when
+        cur.execute("""
+            SELECT ap.player_id, ae.killer_id, ae.created_at 
+            FROM assassin_players ap
+            LEFT JOIN assassin_eliminations ae ON ap.player_id = ae.victim_id AND ap.channel_id = ae.channel_id
+            WHERE ap.channel_id = %s AND ap.is_active = FALSE 
+            ORDER BY ae.created_at DESC NULLS LAST
+            """, (channel_id,))
+        eliminated_players_data = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if not eliminated_players_data:
+            say("No players have been eliminated yet in this game.")
+            return
+        
+        dead_list_lines = []
+        for victim_id, killer_id, eliminated_at in eliminated_players_data:
+            victim_name = get_user_name(victim_id)
+            if killer_id and eliminated_at:
+                 killer_name = get_user_name(killer_id)
+                 eliminated_at_str = eliminated_at.strftime("%Y-%m-%d %H:%M")
+                 dead_list_lines.append(f"• {victim_name} (eliminated by {killer_name})")
+            else:
+                 # Should ideally not happen if data is consistent, but handles edge cases
+                 dead_list_lines.append(f"• {victim_name} (Eliminated)") 
+
+        dead_list = "\n".join(dead_list_lines)
+        say(f"Players who have been eliminated:\n{dead_list}")
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"🔴 Error in assassin_dead_command: {error}")
+        say("Sorry, I couldn't fetch the list of eliminated players.")
+
+def handle_assassin_killcount_command(message, say):
+    """Displays the top 3 players by kill count."""
+    channel_id = message['channel']
+    try:
+        conn = psycopg2.connect(os.environ.get("DATABASE_URL"))
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT player_id, kill_count 
+            FROM assassin_players 
+            WHERE channel_id = %s AND kill_count > 0
+            ORDER BY kill_count DESC 
+            LIMIT 3
+            """, (channel_id,))
+        top_killers = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if not top_killers:
+            say("No kills have been recorded yet in this game.")
+            return
+        
+        killboard_lines = []
+        for i, (player_id, kill_count) in enumerate(top_killers):
+            player_name = get_user_name(player_id)
+            killboard_lines.append(f"{i+1}. {player_name} - {kill_count} kills")
+            
+        killboard_text = "\n".join(killboard_lines)
+        say(f"*Assassin Killboard (Top 3):*\n{killboard_text}")
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"🔴 Error in assassin_killcount_command: {error}")
+        say("Sorry, I couldn't fetch the killboard.")
+
+def handle_assassin_end_request(message, client, say):
+    """Handles the initial request to end the game, sending a confirmation."""
+    channel_id = message['channel']
+    user_id = message['user']
+    try:
+        conn = psycopg2.connect(os.environ.get("DATABASE_URL"))
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM assassin_players WHERE channel_id = %s AND is_active = TRUE", (channel_id,))
+        active_game_count = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+
+        if active_game_count == 0:
+            say("There is no active Assassin game in this channel to end.")
+            return
+
+        client.chat_postEphemeral(
+            channel=channel_id,
+            user=user_id,
+            text="Are you sure you want to end the current Assassin game? This cannot be undone.",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "Are you sure you want to end the current Assassin game? This will clear all game data for this channel."}}, {"type": "actions", "elements": [{"type": "button", "text": {"type": "plain_text", "text": "Confirm End Game"}, "style": "danger", "action_id": "confirm_end_assassin_action"}, {"type": "button", "text": {"type": "plain_text", "text": "Cancel"}, "action_id": "cancel_end_assassin_action"}]}]
+        )
+    except Exception as e:
+        print(f"🔴 Error sending end game confirmation: {e}")
+        say("Sorry, I couldn't process the request to end the game.")
+    finally:
+        # Ensure connection is closed even if errors occur before explicit close
+        if 'conn' in locals() and conn is not None:
+             if not conn.closed:
+                  cur.close()
+                  conn.close()
+
+
+# --- Keyword Listeners ---
+
+# ... (Existing Spot Bot listeners)
 @app.message(re.compile(r"^spotboard$", re.IGNORECASE))
 def handle_spotboard_keyword(message, say):
     handle_spotboard_command(message, say)
@@ -684,7 +1079,38 @@ def handle_mystats_keyword(message, say):
 def handle_explode_keyword(message, say, client):
     handle_explode_command(message, say, client)
 
+# Assassin Game Keyword Listeners
+@app.message(re.compile(r"^assassin start", re.IGNORECASE))
+def handle_assassin_start_keyword(message, say, client):
+    handle_assassin_start_command(message, say, client)
+
+@app.message(re.compile(r"^(assassin target|mytarget)$", re.IGNORECASE))
+def handle_assassin_target_keyword(message, say, client):
+    handle_assassin_target_command(message, say, client)
+    
+@app.message(re.compile(r"^(eliminated|eliminate)", re.IGNORECASE))
+def handle_eliminated_keyword(message, say, client):
+    handle_eliminated_command(message, say, client)
+
+@app.message(re.compile(r"^assassin alive$", re.IGNORECASE))
+def handle_assassin_alive_keyword(message, say):
+    handle_assassin_alive_command(message, say)
+
+@app.message(re.compile(r"^assassin dead$", re.IGNORECASE))
+def handle_assassin_dead_keyword(message, say):
+    handle_assassin_dead_command(message, say)
+
+@app.message(re.compile(r"^assassin killcount$", re.IGNORECASE))
+def handle_assassin_killcount_keyword(message, say):
+    handle_assassin_killcount_command(message, say)
+
+@app.message(re.compile(r"^assassin end$", re.IGNORECASE))
+def handle_assassin_end_keyword(message, client, say):
+    handle_assassin_end_request(message, client, say)
+
+
 # --- Action (Button Click) Listeners ---
+# ... (Existing reset listeners)
 @app.action("confirm_reset_action")
 def handle_confirm_reset_action(ack, body, client):
     """
@@ -698,7 +1124,7 @@ def handle_confirm_reset_action(ack, body, client):
         channel_id = body['channel']['id']
         season_to_end_id = get_current_season_id()
         announce_season_winner(season_to_end_id, channel_id, is_manual_reset=True)
-        
+
         manual_reset_timestamps[channel_id] = datetime.now(pytz.timezone('America/Los_Angeles'))
         print(f"--- MANUAL RESET: Reset timestamp set for channel {channel_id} ---")
 
@@ -720,14 +1146,94 @@ def handle_cancel_reset_action(ack, body, client):
     except Exception as e:
         print(f"🔴 Error in cancel_reset_action: {e}")
 
+@app.action("confirm_end_assassin_action")
+def handle_confirm_end_action(ack, body, client, say):
+    """Handles the confirmation to end the Assassin game."""
+    ack() # Acknowledge the action immediately
+
+    channel_id = body['channel']['id']
+    user_id = body['user']['id'] # Get the user who clicked the button
+    message_ts = body['container']['message_ts']
+
+    conn = None # Initialize conn outside try
+    cur = None # Initialize cur outside try
+    try:
+        conn = psycopg2.connect(os.environ.get("DATABASE_URL"))
+        cur = conn.cursor()
+        
+        print(f"--- DEBUG: Attempting to DELETE game data for channel {channel_id} ---")
+        cur.execute("DELETE FROM assassin_players WHERE channel_id = %s", (channel_id,))
+        players_deleted = cur.rowcount
+        cur.execute("DELETE FROM assassin_eliminations WHERE channel_id = %s", (channel_id,))
+        eliminations_deleted = cur.rowcount
+        
+        conn.commit()
+        print(f"--- DEBUG: DELETEd {players_deleted} players and {eliminations_deleted} eliminations ---")
+
+
+        say(f"🛑 The Assassin game in this channel has been manually ended by <@{user_id}>.")
+        print(f"--- ASSASSIN GAME ENDED in channel {channel_id} by user {user_id} ---")
+
+        # Delete the original ephemeral confirmation message
+        # We put this *after* the critical DB operations
+        client.chat_delete(
+            channel=channel_id,
+            ts=message_ts
+        )
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"🔴 Error in confirm_end_assassin_action: {error}")
+    finally:
+        # Ensure the database connection is always closed
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+        print("--- DEBUG: Database connection closed in confirm_end_assassin_action ---")
+
+
+@app.action("cancel_end_assassin_action")
+def handle_cancel_end_action(ack, body, client):
+    """Handles the cancellation of ending the Assassin game."""
+    ack() # Acknowledge the action immediately
+
+    channel_id = body['channel']['id']
+    # Correct way to get ts for ephemeral message actions
+    message_ts = body['container']['message_ts']
+    try:
+        # We still want to delete the message if the user clicks Cancel
+        client.chat_delete(
+            channel=channel_id,
+            ts=message_ts # Use the correctly retrieved timestamp
+        )
+    except Exception as e:
+        print(f"🔴 Error in cancel_end_assassin_action: {e}")
+
+
 @app.event("app_mention")
 def handle_mention(event, say, client):
     """
-    Handles leaderboard commands when the bot is @-mentioned.
+    Handles commands when the bot is @-mentioned.
     """
     command_text = event['text'].strip().lower()
-    
-    if "explode" in command_text:
+
+    # Assassin game commands via mention
+    if "assassin start" in command_text:
+        handle_assassin_start_command(event, say, client)
+    elif "assassin target" in command_text or "mytarget" in command_text:
+        handle_assassin_target_command(event, say, client)
+    elif "eliminated" in command_text or "eliminate" in command_text:
+        handle_eliminated_command(event, say, client)
+    elif "assassin alive" in command_text:
+         handle_assassin_alive_command(event, say)
+    elif "assassin dead" in command_text:
+         handle_assassin_dead_command(event, say)
+    elif "assassin killcount" in command_text:
+         handle_assassin_killcount_command(event, say)
+    elif "assassin end" in command_text:
+         handle_assassin_end_request(event, client, say)
+    # Existing Spot Bot commands via mention
+    elif "explode" in command_text:
         handle_explode_command(event, say, client)
     elif "mystats" in command_text:
         handle_mystats_command(event, say)
@@ -751,19 +1257,19 @@ def handle_mention(event, say, client):
 # --- Main Application Execution ---
 if __name__ == "__main__":
     setup_database()
-    
+
     scheduler = BackgroundScheduler(timezone=pytz.timezone('America/Los_Angeles'))
-    
+
     scheduler.add_job(
-        end_of_season_job, 
-        'cron', 
-        day_of_week='thu', 
-        hour=0, 
-        minute=0, 
-        week='*/2', 
+        end_of_season_job,
+        'cron',
+        day_of_week='thu',
+        hour=0,
+        minute=0,
+        week='*/2',
         start_date='2025-10-09 00:00:00'
     )
-    
+
     scheduler.add_job(
         daily_bonus_job,
         'cron',
@@ -773,7 +1279,7 @@ if __name__ == "__main__":
 
     scheduler.start()
     print("⏰ Scheduler started. All jobs are scheduled.")
-    
+
     print("⚡️ Spot Bot is running!")
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     handler.start()
