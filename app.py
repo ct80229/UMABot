@@ -20,10 +20,11 @@ app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
 
 # --- Globals & Cache ---
 BOT_USER_ID = app.client.auth_test()["user_id"]
+ADMIN_USER_ID = "U06HB636NHG" # Your User ID
 user_cache = {}
 daily_bonus_users = {}
 # The explosion images are now loaded from a local directory
-EXPLOSIONS_DIR = "explosions" 
+EXPLOSIONS_DIR = "explosions"
 
 # --- Season Calculation (FIXED SCHEDULE) ---
 # The master schedule is now a fixed constant and will not be changed.
@@ -50,6 +51,8 @@ def announce_season_winner(season_id_to_process, channel_id, is_manual_reset=Fal
     Can be used by both scheduled jobs and manual resets.
     """
     print(f"--- Announcing winner for season: {season_id_to_process} in channel {channel_id} ---")
+    conn = None
+    cur = None
     try:
         db_url = os.environ.get("DATABASE_URL")
         conn = psycopg2.connect(db_url)
@@ -78,14 +81,16 @@ def announce_season_winner(season_id_to_process, channel_id, is_manual_reset=Fal
             announcement += f"Congratulations to *{winner_name}* for winning the {period} with {int(winner_score)} spots!"
         else:
             announcement += "No spots were recorded in the last period. A fresh start!"
-        
+
         app.client.chat_postMessage(channel=channel_id, text=announcement)
-        
-        cur.close()
-        conn.close()
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error in announce_season_winner: {error}")
+    finally:
+        if cur is not None:
+             cur.close()
+        if conn is not None:
+             conn.close()
 
 
 # --- Scheduled Job Functions ---
@@ -97,6 +102,8 @@ def daily_bonus_job():
     global daily_bonus_users
     daily_bonus_users.clear()
 
+    conn = None
+    cur = None
     try:
         db_url = os.environ.get("DATABASE_URL")
         conn = psycopg2.connect(db_url)
@@ -111,9 +118,9 @@ def daily_bonus_job():
                 UNION
                 SELECT spotted_id FROM spots WHERE channel_id = %s
             """, (channel_id, channel_id))
-            
+
             participants = [row[0] for row in cur.fetchall()]
-            
+
             if len(participants) >= 2:
                 bonus_targets = random.sample(participants, 2)
                 daily_bonus_users[channel_id] = set(bonus_targets)
@@ -123,12 +130,15 @@ def daily_bonus_job():
                 app.client.chat_postMessage(channel=channel_id, text=announcement)
                 print(f"--- Bonus users for channel {channel_id}: {bonus_targets} ---")
 
-        cur.close()
-        conn.close()
         print("--- Daily Bonus Job Finished ---")
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error in daily_bonus_job: {error}")
+    finally:
+        if cur is not None:
+             cur.close()
+        if conn is not None:
+             conn.close()
 
 def end_of_season_job():
     """
@@ -136,26 +146,35 @@ def end_of_season_job():
     """
     print("--- Running Scheduled End of Season Job ---")
     global manual_reset_timestamps
-    
+
     current_season_start_str = get_current_season_id()
     current_season_start_dt = datetime.strptime(current_season_start_str, '%Y-%m-%d').astimezone(pytz.timezone('America/Los_Angeles'))
     previous_season_start_dt = current_season_start_dt - timedelta(days=14)
     previous_season_id = previous_season_start_dt.strftime('%Y-%m-%d')
-    
+
+    conn = None
+    cur = None
     try:
         db_url = os.environ.get("DATABASE_URL")
         conn = psycopg2.connect(db_url)
         cur = conn.cursor()
         cur.execute("SELECT DISTINCT channel_id FROM spots WHERE season_id = %s", (previous_season_id,))
         channels = [row[0] for row in cur.fetchall()]
-        cur.close()
-        conn.close()
+        cur.close() # Close cursor after fetching channels
+        conn.close() # Close connection after fetching channels
 
         for channel_id in channels:
+            # Reconnect or pass connection details if needed by announce_season_winner
             announce_season_winner(previous_season_id, channel_id, is_manual_reset=False)
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error getting channels in end_of_season_job: {error}")
+    finally:
+        if cur is not None and not cur.closed:
+             cur.close()
+        if conn is not None and not conn.closed:
+             conn.close()
+
 
     # Clear all manual resets for the new season
     manual_reset_timestamps.clear()
@@ -168,6 +187,7 @@ def setup_database():
     """
     Connects to the database and creates all necessary tables for both games.
     """
+    # ... (SQL commands remain the same) ...
     spots_table_command = """
     CREATE TABLE IF NOT EXISTS spots (
         id SERIAL PRIMARY KEY,
@@ -205,6 +225,7 @@ def setup_database():
     );
     """
     conn = None
+    cur = None
     try:
         db_url = os.environ.get("DATABASE_URL")
         if not db_url:
@@ -216,13 +237,14 @@ def setup_database():
         cur.execute(assassin_players_table_command)
         cur.execute(assassin_eliminations_table_command)
         conn.commit()
-        cur.close()
         print("✅ All database tables are ready.")
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error while connecting to PostgreSQL: {error}")
     finally:
+        if cur is not None:
+             cur.close()
         if conn is not None:
-            conn.close()
+             conn.close()
 
 def get_user_name(user_id):
     if user_id in user_cache:
@@ -246,6 +268,7 @@ def is_spot_message_and_not_command(message):
 
 @app.message(matchers=[is_spot_message_and_not_command])
 def handle_spot_message(message, say):
+    # ... (code is unchanged) ...
     print("\n--- DEBUG: `handle_spot_message` was triggered. ---")
 
     if 'user' not in message or 'files' not in message or 'text' not in message:
@@ -254,12 +277,14 @@ def handle_spot_message(message, say):
     spotter_id = message['user']
     text = message['text']
     channel_id = message['channel']
-    
+
     mentioned_users = set(re.findall(r"<@(\w+)>", text))
     if not mentioned_users:
         return
 
     successful_spots = 0
+    conn = None
+    cur = None
     try:
         db_url = os.environ.get("DATABASE_URL")
         conn = psycopg2.connect(db_url)
@@ -268,7 +293,7 @@ def handle_spot_message(message, say):
         for spotted_id in mentioned_users:
             if spotter_id == spotted_id:
                 continue
-            
+
             spotter_points_to_award = 1
             if channel_id in daily_bonus_users and spotted_id in daily_bonus_users[channel_id]:
                 spotter_points_to_award = 2
@@ -278,7 +303,7 @@ def handle_spot_message(message, say):
             INSERT INTO spots (spotter_id, spotted_id, channel_id, message_ts, image_url, season_id, spotter_points, caught_points)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
             """
-            
+
             spot_data = (
                 spotter_id,
                 spotted_id,
@@ -289,13 +314,11 @@ def handle_spot_message(message, say):
                 spotter_points_to_award,
                 1 # caught_points is always 1
             )
-            
+
             cur.execute(insert_command, spot_data)
             successful_spots += 1
-        
+
         conn.commit()
-        cur.close()
-        conn.close()
 
         if successful_spots > 0:
             app.client.reactions_add(
@@ -306,11 +329,17 @@ def handle_spot_message(message, say):
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 DEBUG: An error occurred during database operation: {error}")
+    finally:
+         if cur is not None:
+             cur.close()
+         if conn is not None:
+             conn.close()
 
 @app.event({"type": "message", "subtype": "message_deleted"})
 def handle_message_deletion(event):
+    # ... (code is unchanged) ...
     print("\n--- DEBUG: `handle_message_deletion` (subtype) was triggered. ---")
-    
+
     if 'previous_message' not in event or 'ts' not in event['previous_message']:
         print("--- DEBUG: No previous_message or ts found in deletion event. Skipping. ---")
         return
@@ -318,38 +347,42 @@ def handle_message_deletion(event):
     deleted_ts = event['previous_message']['ts']
     print(f"--- DEBUG: A message with timestamp {deleted_ts} was deleted. Checking database. ---")
 
+    conn = None
+    cur = None
     try:
         db_url = os.environ.get("DATABASE_URL")
         conn = psycopg2.connect(db_url)
         cur = conn.cursor()
 
         delete_command = "DELETE FROM spots WHERE message_ts = %s"
-        
+
         cur.execute(delete_command, (deleted_ts,))
-        
+
         if cur.rowcount > 0:
             print(f"--- SUCCESS: Deleted {cur.rowcount} spot record(s) with timestamp {deleted_ts}. ---")
         else:
             print(f"--- INFO: Deleted message {deleted_ts} was not a spot record. No action taken. ---")
 
         conn.commit()
-        cur.close()
-        conn.close()
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 DEBUG: An error occurred during message deletion handling: {error}")
+    finally:
+        if cur is not None:
+             cur.close()
+        if conn is not None:
+             conn.close()
+
 
 # --- Command Handlers and Listeners (Spot Bot) ---
 # ... (All your existing spotboard, caughtboard, miss you, etc. handlers)
 
 def handle_spotboard_command(message, say):
-    """
-    Generates and posts the seasonal spotboard, respecting manual resets.
-    """
+    # ... (code is unchanged) ...
     try:
         channel_id = message['channel']
         current_season = get_current_season_id()
-        
+
         db_url = os.environ.get("DATABASE_URL")
         conn = psycopg2.connect(db_url)
         cur = conn.cursor()
@@ -384,21 +417,25 @@ def handle_spotboard_command(message, say):
         for i, row in enumerate(results):
             user_id, score = row; score = int(score); user_name = get_user_name(user_id)
             leaderboard_text += f"{i+1}. {user_name} - {score}\n"
-        
+
         say(leaderboard_text)
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error handling spotboard command: {error}")
         say("Sorry, I had trouble fetching the spotboard.")
+    finally: # Ensure connection is closed
+        if 'cur' in locals() and cur is not None and not cur.closed:
+             cur.close()
+        if 'conn' in locals() and conn is not None and not conn.closed:
+             conn.close()
+
 
 def handle_caughtboard_command(message, say):
-    """
-    Generates and posts the seasonal caughtboard, respecting manual resets.
-    """
+    # ... (code is unchanged) ...
     try:
         channel_id = message['channel']
         current_season = get_current_season_id()
-        
+
         db_url = os.environ.get("DATABASE_URL")
         conn = psycopg2.connect(db_url)
         cur = conn.cursor()
@@ -433,14 +470,20 @@ def handle_caughtboard_command(message, say):
         for i, row in enumerate(results):
             user_id, score = row; score = int(score); user_name = get_user_name(user_id)
             leaderboard_text += f"{i+1}. {user_name} - {score}\n"
-        
+
         say(leaderboard_text)
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error handling caughtboard command: {error}")
         say("Sorry, I had trouble fetching the caughtboard.")
+    finally: # Ensure connection is closed
+        if 'cur' in locals() and cur is not None and not cur.closed:
+             cur.close()
+        if 'conn' in locals() and conn is not None and not conn.closed:
+             conn.close()
 
 def handle_alltime_spotboard_command(message, say):
+    # ... (code is unchanged) ...
     try:
         channel_id = message['channel']
         db_url = os.environ.get("DATABASE_URL")
@@ -469,8 +512,14 @@ def handle_alltime_spotboard_command(message, say):
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error handling all-time spotboard command: {error}")
         say("Sorry, I had trouble fetching the all-time spotboard.")
+    finally: # Ensure connection is closed
+        if 'cur' in locals() and cur is not None and not cur.closed:
+             cur.close()
+        if 'conn' in locals() and conn is not None and not conn.closed:
+             conn.close()
 
 def handle_alltime_caughtboard_command(message, say):
+    # ... (code is unchanged) ...
     try:
         channel_id = message['channel']
         db_url = os.environ.get("DATABASE_URL")
@@ -499,15 +548,18 @@ def handle_alltime_caughtboard_command(message, say):
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error handling all-time caughtboard command: {error}")
         say("Sorry, I had trouble fetching the all-time caughtboard.")
+    finally: # Ensure connection is closed
+        if 'cur' in locals() and cur is not None and not cur.closed:
+             cur.close()
+        if 'conn' in locals() and conn is not None and not conn.closed:
+             conn.close()
 
 def handle_miss_you_command(message, say):
-    """
-    Finds a random picture of a mentioned user and posts it.
-    """
+    # ... (code is unchanged) ...
     try:
         text = message.get('text', '')
         mentioned_users = re.findall(r"<@(\w+)>", text)
-        
+
         if not mentioned_users:
             say("You need to tell me who you miss! Please mention a user, like `miss you @Rohan`.")
             return
@@ -521,9 +573,9 @@ def handle_miss_you_command(message, say):
 
         query = "SELECT image_url FROM spots WHERE spotted_id = %s AND channel_id = %s AND is_valid = TRUE"
         cur.execute(query, (target_user_id, channel_id))
-        
+
         image_urls = [row[0] for row in cur.fetchall()]
-        
+
         cur.close()
         conn.close()
 
@@ -534,17 +586,20 @@ def handle_miss_you_command(message, say):
 
         random_image_url = random.choice(image_urls)
         target_user_name = get_user_name(target_user_id)
-        
+
         say(f"Missing them? Here's a memory of {target_user_name}!\n{random_image_url}")
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error handling 'miss you' command: {error}")
         say("Sorry, I had a problem fetching that picture.")
+    finally: # Ensure connection is closed
+        if 'cur' in locals() and cur is not None and not cur.closed:
+             cur.close()
+        if 'conn' in locals() and conn is not None and not conn.closed:
+             conn.close()
 
 def handle_mystats_command(message, say):
-    """
-    Calculates and displays personal stats for the user who sent the command.
-    """
+    # ... (code is unchanged) ...
     try:
         user_id = message['user']
         channel_id = message['channel']
@@ -592,15 +647,18 @@ def handle_mystats_command(message, say):
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error handling mystats command: {error}")
         say("Sorry, I had trouble fetching your stats.")
+    finally: # Ensure connection is closed
+        if 'cur' in locals() and cur is not None and not cur.closed:
+             cur.close()
+        if 'conn' in locals() and conn is not None and not conn.closed:
+             conn.close()
 
 def handle_explode_command(message, say, client):
-    """
-    Finds a random picture of a user, overlays a random explosion, and uploads it.
-    """
+    # ... (code is unchanged) ...
     try:
         text = message.get('text', '')
         mentioned_users = re.findall(r"<@(\w+)>", text)
-        
+
         if not mentioned_users:
             say("You need to tell me who to explode! Please mention a user, like `explode @Rohan`.")
             return
@@ -624,7 +682,7 @@ def handle_explode_command(message, say, client):
             return
 
         random_image_url = random.choice(image_urls)
-        
+
         # 2. Download the user image and select a random local explosion image
         auth_header = {"Authorization": f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"}
         user_image_response = requests.get(random_image_url, headers=auth_header)
@@ -650,7 +708,7 @@ def handle_explode_command(message, say, client):
 
         # Composite the images
         composite_image = Image.alpha_composite(base_image, explosion_image)
-        
+
         # Save the result to a temporary in-memory file
         temp_file = io.BytesIO()
         composite_image.save(temp_file, format='PNG')
@@ -668,17 +726,32 @@ def handle_explode_command(message, say, client):
     except Exception as e:
         print(f"🔴 Error in explode command: {e}")
         say("Sorry, I had trouble creating the explosion. The image might be too powerful.")
+    finally: # Ensure connection is closed
+        if 'cur' in locals() and cur is not None and not cur.closed:
+             cur.close()
+        if 'conn' in locals() and conn is not None and not conn.closed:
+             conn.close()
 
 # --- Assassin Game Command Handlers ---
 
 def handle_assassin_start_command(message, say, client):
-    """
-    Starts a new game of Assassin in the current channel.
-    """
+    # ... (Admin check and start logic remains the same) ...
     channel_id = message['channel']
     starter_id = message['user']
     text = message.get('text', '')
-    
+
+    # --- ADMIN CHECK ---
+    if starter_id != ADMIN_USER_ID:
+        client.chat_postEphemeral(
+            channel=channel_id,
+            user=starter_id,
+            text="Sorry, only the designated admin can start an Assassin game."
+        )
+        return
+    # --- END ADMIN CHECK ---
+
+    conn = None
+    cur = None
     try:
         db_url = os.environ.get("DATABASE_URL")
         conn = psycopg2.connect(db_url)
@@ -688,23 +761,19 @@ def handle_assassin_start_command(message, say, client):
         cur.execute("SELECT COUNT(*) FROM assassin_players WHERE channel_id = %s AND is_active = TRUE", (channel_id,))
         active_game_count = cur.fetchone()[0]
         if active_game_count > 0:
-            print(active_game_count)
-            cur.close()
-            conn.close()
+            say("An Assassin game is already in progress in this channel! Use `assassin end` to stop it first.")
             return
 
         # 2. Gather players
         mentioned_users = list(set(re.findall(r"<@(\w+)>", text)))
         if len(mentioned_users) < 3:
             say("You need at least 3 players to start a game of Assassin. Please mention everyone who is playing.")
-            cur.close()
-            conn.close()
             return
-        
+
         # 3. Clear old game data for the channel and shuffle players
         cur.execute("DELETE FROM assassin_players WHERE channel_id = %s", (channel_id,))
         cur.execute("DELETE FROM assassin_eliminations WHERE channel_id = %s", (channel_id,))
-        
+
         players = mentioned_users
         random.shuffle(players)
 
@@ -715,15 +784,14 @@ def handle_assassin_start_command(message, say, client):
                 "INSERT INTO assassin_players (channel_id, player_id, target_id) VALUES (%s, %s, %s)",
                 (channel_id, player_id, target_id)
             )
-        
-        conn.commit()
-        
-        # 5. Announce the game start and notify players of their targets privately
-        player_names = ", ".join([f"<@{p}>" for p in players])
-        say(f"A new game of Assassin has begun!\n*Players:* {player_names}\nEach player has been sent their first target privately. Good luck!")
 
-        # --- DEBUGGING START ---
-        print(f"--- Attempting to send targets for channel {channel_id} ---")
+        conn.commit()
+
+        # 5. Announce the game start and notify players of their targets privately via DM
+        player_names = ", ".join([f"<@{p}>" for p in players])
+        say(f"A new game of Assassin has begun!\n*Players:* {player_names}\nEach player has been sent their first target via DM. Good luck!")
+
+        print(f"--- Attempting to send targets for channel {channel_id} via DM ---")
         for player_id in players:
             try:
                 cur.execute("SELECT target_id FROM assassin_players WHERE player_id = %s AND channel_id = %s", (player_id, channel_id))
@@ -734,39 +802,36 @@ def handle_assassin_start_command(message, say, client):
 
                 target_id = target_id_result[0]
                 target_name = get_user_name(target_id)
-                print(f"--- DEBUG: Preparing to notify player {player_id} ({get_user_name(player_id)}) their target is {target_id} ({target_name}) ---")
+                print(f"--- DEBUG: Preparing DM for player {player_id} ({get_user_name(player_id)}) their target is {target_id} ({target_name}) ---")
 
-                client.chat_postEphemeral(
-                    channel=channel_id,
-                    user=player_id,
-                    text=f"Your first target is: *{target_name}*."
+                client.chat_postMessage(
+                    channel=player_id, # Send to the user directly
+                    text=f"Your first Assassin target in the <#{channel_id}> channel is: *{target_name}*."
                 )
-                print(f"--- DEBUG: Successfully sent ephemeral message to {player_id} ---")
+                print(f"--- DEBUG: Successfully sent DM to {player_id} ---")
             except Exception as e:
-                # Catch errors specifically within the loop
-                print(f"🔴 DEBUG: Error sending ephemeral message to {player_id}: {e}")
-        # --- DEBUGGING END ---
-
-        cur.close()
-        conn.close()
+                print(f"🔴 DEBUG: Error sending DM to {player_id}: {e}")
+                starter_name = get_user_name(starter_id)
+                failed_player_name = get_user_name(player_id)
+                say(f"⚠️ {starter_name}, I couldn't send a DM to {failed_player_name}. They might need to check their app permissions or start a conversation with me first.")
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error in assassin_start_command: {error}")
         say("Sorry, I ran into an error trying to start the game.")
     finally:
-        # Ensure connection is closed even if errors occur before explicit close
-        if 'conn' in locals() and conn is not None:
-             if not conn.closed:
-                  cur.close()
-                  conn.close()
+        # Ensure connection is closed
+        if cur is not None:
+             cur.close()
+        if conn is not None:
+             conn.close()
 
 def handle_assassin_target_command(message, say, client):
-    """
-    Privately tells a player who their current target is.
-    """
+    # ... (code is unchanged) ...
     channel_id = message['channel']
     player_id = message['user']
 
+    conn = None
+    cur = None
     try:
         db_url = os.environ.get("DATABASE_URL")
         conn = psycopg2.connect(db_url)
@@ -786,31 +851,30 @@ def handle_assassin_target_command(message, say, client):
 
         target_name = get_user_name(target_id)
         client.chat_postEphemeral(channel=channel_id, user=player_id, text=f"Your current target is: *{target_name}*.")
-        
-        cur.close()
-        conn.close()
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error in assassin_target_command: {error}")
         client.chat_postEphemeral(channel=channel_id, user=player_id, text="Sorry, I had a problem fetching your target.")
+    finally:
+        if cur is not None:
+             cur.close()
+        if conn is not None:
+             conn.close()
+
 
 def handle_eliminated_command(message, say, client):
-    """
-    Handles a player's attempt to eliminate their target.
-    """
+    # ... (code is unchanged, including the fix to ignore self-messages) ...
     print(f"\n--- DEBUG: handle_eliminated_command triggered by message: {message.get('text', '')[:50]} ---")
     print(f"--- DEBUG: Message user: {message.get('user')}, Bot ID: {BOT_USER_ID}, Message has bot_id: {'bot_id' in message} ---")
 
-    # --- FIX START ---
     # More robust check: Ignore messages sent by the bot itself OR any other bot
     if message.get('user') == BOT_USER_ID or message.get('bot_id') is not None:
         print("--- DEBUG: Ignoring message from self or another bot in handle_eliminated_command ---")
         return
-    # --- FIX END ---
-    
+
     channel_id = message['channel']
     # Ensure 'user' exists before using it, though the check above should handle most cases
-    killer_id = message.get('user') 
+    killer_id = message.get('user')
     if not killer_id:
         print("--- DEBUG: Message missing 'user' field in handle_eliminated_command. Skipping. ---")
         return # Cannot process if we don't know who sent it
@@ -821,7 +885,7 @@ def handle_eliminated_command(message, say, client):
     if 'files' not in message:
         say("An elimination attempt requires photo or video proof!")
         return
-        
+
     mentioned_users = re.findall(r"<@(\w+)>", text)
     if not mentioned_users:
         say("You must mention the player you are eliminating.")
@@ -842,7 +906,7 @@ def handle_eliminated_command(message, say, client):
         if not killer_data:
             say("You are not a player in the current game.")
             return
-        
+
         killer_target, killer_is_active = killer_data
         if not killer_is_active:
             say("You can't eliminate someone when you've already been eliminated!")
@@ -864,7 +928,7 @@ def handle_eliminated_command(message, say, client):
 
         # Update victim's status
         cur.execute("UPDATE assassin_players SET is_active = FALSE WHERE player_id = %s AND channel_id = %s", (victim_id, channel_id))
-        
+
         # Update killer's status
         cur.execute("UPDATE assassin_players SET target_id = %s, kill_count = kill_count + 1 WHERE player_id = %s AND channel_id = %s", (new_target_id, killer_id, channel_id))
 
@@ -896,7 +960,7 @@ def handle_eliminated_command(message, say, client):
                 user=killer_id,
                 text=f"Congratulations on the elimination! Your new target is: *{new_target_name}*."
             )
-        
+
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error in eliminated_command: {error}")
         say("Sorry, I encountered an error while processing the elimination.")
@@ -909,59 +973,66 @@ def handle_eliminated_command(message, say, client):
 
 
 def handle_assassin_alive_command(message, say):
-    """Lists the players currently active in the Assassin game."""
+    # ... (code is unchanged) ...
     channel_id = message['channel']
+    conn = None
+    cur = None
     try:
         conn = psycopg2.connect(os.environ.get("DATABASE_URL"))
         cur = conn.cursor()
         cur.execute("SELECT player_id FROM assassin_players WHERE channel_id = %s AND is_active = TRUE ORDER BY created_at", (channel_id,))
         active_players_ids = [row[0] for row in cur.fetchall()]
-        cur.close()
-        conn.close()
+
 
         if not active_players_ids:
             say("No game is currently active, or everyone has been eliminated!")
             return
-        
+
         alive_list = "\n".join([f"• {get_user_name(pid)}" for pid in active_players_ids])
         say(f"Players still alive:\n{alive_list}")
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error in assassin_alive_command: {error}")
         say("Sorry, I couldn't fetch the list of active players.")
+    finally:
+        if cur is not None:
+             cur.close()
+        if conn is not None:
+             conn.close()
 
 def handle_assassin_dead_command(message, say):
-    """Lists the players who have been eliminated from the Assassin game."""
+    # ... (code is unchanged) ...
     channel_id = message['channel']
+    conn = None
+    cur = None
     try:
         conn = psycopg2.connect(os.environ.get("DATABASE_URL"))
         cur = conn.cursor()
         # Fetching eliminated players along with who eliminated them and when
         cur.execute("""
-            SELECT ap.player_id, ae.killer_id, ae.created_at 
+            SELECT ap.player_id, ae.killer_id, ae.created_at
             FROM assassin_players ap
             LEFT JOIN assassin_eliminations ae ON ap.player_id = ae.victim_id AND ap.channel_id = ae.channel_id
-            WHERE ap.channel_id = %s AND ap.is_active = FALSE 
+            WHERE ap.channel_id = %s AND ap.is_active = FALSE
             ORDER BY ae.created_at DESC NULLS LAST
             """, (channel_id,))
         eliminated_players_data = cur.fetchall()
-        cur.close()
-        conn.close()
+
 
         if not eliminated_players_data:
             say("No players have been eliminated yet in this game.")
             return
-        
+
         dead_list_lines = []
         for victim_id, killer_id, eliminated_at in eliminated_players_data:
             victim_name = get_user_name(victim_id)
             if killer_id and eliminated_at:
                  killer_name = get_user_name(killer_id)
                  eliminated_at_str = eliminated_at.strftime("%Y-%m-%d %H:%M")
-                 dead_list_lines.append(f"• {victim_name} (eliminated by {killer_name})")
+                 dead_list_lines.append(f"• {victim_name} (eliminated by {killer_name} on {eliminated_at_str})")
             else:
                  # Should ideally not happen if data is consistent, but handles edge cases
-                 dead_list_lines.append(f"• {victim_name} (Eliminated)") 
+                 dead_list_lines.append(f"• {victim_name} (Eliminated)")
 
         dead_list = "\n".join(dead_list_lines)
         say(f"Players who have been eliminated:\n{dead_list}")
@@ -969,51 +1040,73 @@ def handle_assassin_dead_command(message, say):
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error in assassin_dead_command: {error}")
         say("Sorry, I couldn't fetch the list of eliminated players.")
+    finally:
+        if cur is not None:
+             cur.close()
+        if conn is not None:
+             conn.close()
 
 def handle_assassin_killcount_command(message, say):
-    """Displays the top 3 players by kill count."""
+    # ... (code is unchanged) ...
     channel_id = message['channel']
+    conn = None
+    cur = None
     try:
         conn = psycopg2.connect(os.environ.get("DATABASE_URL"))
         cur = conn.cursor()
         cur.execute("""
-            SELECT player_id, kill_count 
-            FROM assassin_players 
+            SELECT player_id, kill_count
+            FROM assassin_players
             WHERE channel_id = %s AND kill_count > 0
-            ORDER BY kill_count DESC 
+            ORDER BY kill_count DESC
             LIMIT 3
             """, (channel_id,))
         top_killers = cur.fetchall()
-        cur.close()
-        conn.close()
+
 
         if not top_killers:
             say("No kills have been recorded yet in this game.")
             return
-        
+
         killboard_lines = []
         for i, (player_id, kill_count) in enumerate(top_killers):
             player_name = get_user_name(player_id)
             killboard_lines.append(f"{i+1}. {player_name} - {kill_count} kills")
-            
+
         killboard_text = "\n".join(killboard_lines)
         say(f"*Assassin Killboard (Top 3):*\n{killboard_text}")
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error in assassin_killcount_command: {error}")
         say("Sorry, I couldn't fetch the killboard.")
+    finally:
+        if cur is not None:
+             cur.close()
+        if conn is not None:
+             conn.close()
 
 def handle_assassin_end_request(message, client, say):
-    """Handles the initial request to end the game, sending a confirmation."""
+    # ... (Admin check added previously) ...
     channel_id = message['channel']
     user_id = message['user']
+
+    # --- ADMIN CHECK ---
+    if user_id != ADMIN_USER_ID:
+        client.chat_postEphemeral(
+            channel=channel_id,
+            user=user_id,
+            text="Sorry, only the designated admin can end an Assassin game."
+        )
+        return
+    # --- END ADMIN CHECK ---
+
+    conn = None
+    cur = None
     try:
         conn = psycopg2.connect(os.environ.get("DATABASE_URL"))
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM assassin_players WHERE channel_id = %s AND is_active = TRUE", (channel_id,))
         active_game_count = cur.fetchone()[0]
-        cur.close()
-        conn.close()
 
         if active_game_count == 0:
             say("There is no active Assassin game in this channel to end.")
@@ -1030,10 +1123,90 @@ def handle_assassin_end_request(message, client, say):
         say("Sorry, I couldn't process the request to end the game.")
     finally:
         # Ensure connection is closed even if errors occur before explicit close
-        if 'conn' in locals() and conn is not None:
-             if not conn.closed:
-                  cur.close()
-                  conn.close()
+        if cur is not None:
+             cur.close()
+        if conn is not None:
+             conn.close()
+
+def handle_assassin_targets_command(message, client):
+    """Admin command to DM the list of current targets."""
+    channel_id = message['channel']
+    user_id = message['user']
+
+    # --- ADMIN CHECK ---
+    if user_id != ADMIN_USER_ID:
+        client.chat_postEphemeral(
+            channel=channel_id,
+            user=user_id,
+            text="Sorry, this is an admin-only command."
+        )
+        return
+    # --- END ADMIN CHECK ---
+
+    conn = None
+    cur = None
+    try:
+        conn = psycopg2.connect(os.environ.get("DATABASE_URL"))
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT player_id, target_id
+            FROM assassin_players
+            WHERE channel_id = %s AND is_active = TRUE
+            ORDER BY created_at
+            """, (channel_id,))
+        targets = cur.fetchall()
+
+        if not targets:
+             client.chat_postMessage(channel=user_id, text=f"No active Assassin game found in <#{channel_id}>.")
+             return
+
+        target_list_lines = [f"*Current Assassin Targets in <#{channel_id}>:*"]
+        for player_id, target_id in targets:
+            player_name = get_user_name(player_id)
+            target_name = get_user_name(target_id)
+            target_list_lines.append(f"• {player_name} is targeting {target_name}")
+
+        target_list_text = "\n".join(target_list_lines)
+        client.chat_postMessage(channel=user_id, text=target_list_text) # Send DM to admin
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"🔴 Error in assassin_targets_command: {error}")
+        client.chat_postMessage(channel=user_id, text="Sorry, I encountered an error fetching the target list.")
+    finally:
+        if cur is not None:
+             cur.close()
+        if conn is not None:
+             conn.close()
+
+def handle_assassin_help_command(message, say):
+    """Displays the help message for the Assassin game."""
+    help_text = """
+*Assassin Game Commands:*
+• `assassin target` or `mytarget`: Privately shows you your current target.
+• `eliminated @target` (with image/video): Report that you have eliminated your target.
+• `assassin alive`: Shows a list of players still in the game.
+• `assassin dead`: Shows a list of eliminated players.
+• `assassin killcount`: Displays the top 3 players by number of eliminations.
+"""
+    say(help_text)
+
+def handle_spot_help_command(message, say):
+    """Displays the help message for the Spot Bot game."""
+    help_text = """
+*Spot Bot Commands:*
+• `spot @user` or `spotted @user` (with image): Record a spot. Counts for 1 point (or 2 for daily bonus targets!).
+• `spotboard`: Show the seasonal leaderboard of top spotters.
+• `caughtboard`: Show the seasonal leaderboard of most spotted players.
+• `alltimespotboard`: Show the all-time leaderboard of top spotters.
+• `alltimecaughtboard`: Show the all-time leaderboard of most spotted players.
+• `reset`: Manually end the current season and start a new one (requires confirmation).
+• `miss you @user` or `i miss u @user`: Shows a random past spot picture of the mentioned user.
+• `mystats`: Shows your personal spotting stats in this channel.
+• `explode @user`: Overlays a random explosion on a random spot picture of the mentioned user.
+• `assassin help`: Show commands for the Assassin game.
+"""
+    say(help_text)
 
 
 # --- Keyword Listeners ---
@@ -1054,7 +1227,7 @@ def handle_alltime_spotboard_keyword(message, say):
 @app.message(re.compile(r"^(alltimecaughtboard|all time caught board)$", re.IGNORECASE))
 def handle_alltime_caughtboard_keyword(message, say):
     handle_alltime_caughtboard_command(message, say)
-    
+
 @app.message(re.compile(r"^reset$", re.IGNORECASE))
 def handle_reset_request(message, client):
     try:
@@ -1074,10 +1247,14 @@ def handle_miss_you_keyword(message, say):
 @app.message(re.compile(r"^mystats$", re.IGNORECASE))
 def handle_mystats_keyword(message, say):
     handle_mystats_command(message, say)
-    
+
 @app.message(re.compile(r"^explode", re.IGNORECASE))
 def handle_explode_keyword(message, say, client):
     handle_explode_command(message, say, client)
+
+@app.message(re.compile(r"^help$", re.IGNORECASE))
+def handle_spot_help_keyword(message, say):
+    handle_spot_help_command(message, say)
 
 # Assassin Game Keyword Listeners
 @app.message(re.compile(r"^assassin start", re.IGNORECASE))
@@ -1087,9 +1264,12 @@ def handle_assassin_start_keyword(message, say, client):
 @app.message(re.compile(r"^(assassin target|mytarget)$", re.IGNORECASE))
 def handle_assassin_target_keyword(message, say, client):
     handle_assassin_target_command(message, say, client)
-    
+
 @app.message(re.compile(r"^(eliminated|eliminate)", re.IGNORECASE))
 def handle_eliminated_keyword(message, say, client):
+    # This might need adjustment if "eliminate" is used elsewhere
+    # Check if the message context implies the assassin game.
+    # For now, assuming any "eliminated" refers to assassin.
     handle_eliminated_command(message, say, client)
 
 @app.message(re.compile(r"^assassin alive$", re.IGNORECASE))
@@ -1107,6 +1287,14 @@ def handle_assassin_killcount_keyword(message, say):
 @app.message(re.compile(r"^assassin end$", re.IGNORECASE))
 def handle_assassin_end_keyword(message, client, say):
     handle_assassin_end_request(message, client, say)
+
+@app.message(re.compile(r"^assassin targets$", re.IGNORECASE))
+def handle_assassin_targets_keyword(message, client):
+    handle_assassin_targets_command(message, client)
+
+@app.message(re.compile(r"^assassin help$", re.IGNORECASE))
+def handle_assassin_help_keyword(message, say):
+    handle_assassin_help_command(message, say)
 
 
 # --- Action (Button Click) Listeners ---
@@ -1153,6 +1341,7 @@ def handle_confirm_end_action(ack, body, client, say):
 
     channel_id = body['channel']['id']
     user_id = body['user']['id'] # Get the user who clicked the button
+    # Correct way to get ts for ephemeral message actions
     message_ts = body['container']['message_ts']
 
     conn = None # Initialize conn outside try
@@ -1160,13 +1349,13 @@ def handle_confirm_end_action(ack, body, client, say):
     try:
         conn = psycopg2.connect(os.environ.get("DATABASE_URL"))
         cur = conn.cursor()
-        
+
         print(f"--- DEBUG: Attempting to DELETE game data for channel {channel_id} ---")
         cur.execute("DELETE FROM assassin_players WHERE channel_id = %s", (channel_id,))
         players_deleted = cur.rowcount
         cur.execute("DELETE FROM assassin_eliminations WHERE channel_id = %s", (channel_id,))
         eliminations_deleted = cur.rowcount
-        
+
         conn.commit()
         print(f"--- DEBUG: DELETEd {players_deleted} players and {eliminations_deleted} eliminations ---")
 
@@ -1183,6 +1372,8 @@ def handle_confirm_end_action(ack, body, client, say):
 
     except (Exception, psycopg2.DatabaseError) as error:
         print(f"🔴 Error in confirm_end_assassin_action: {error}")
+        # Try to inform the user even if the main action failed
+        # No need to post another error message here if deletion fails
     finally:
         # Ensure the database connection is always closed
         if cur is not None:
@@ -1216,42 +1407,52 @@ def handle_mention(event, say, client):
     Handles commands when the bot is @-mentioned.
     """
     command_text = event['text'].strip().lower()
+    # Extract the actual text after the mention
+    # Example: "<@BOTID> help" -> "help"
+    # Example: "<@BOTID>" -> ""
+    command_part = re.sub(r'^<@\w+>\s*', '', command_text).strip()
 
     # Assassin game commands via mention
-    if "assassin start" in command_text:
+    if command_part.startswith("assassin start"):
         handle_assassin_start_command(event, say, client)
-    elif "assassin target" in command_text or "mytarget" in command_text:
+    elif command_part == "assassin target" or command_part == "mytarget":
         handle_assassin_target_command(event, say, client)
-    elif "eliminated" in command_text or "eliminate" in command_text:
+    elif command_part.startswith("eliminated") or command_part.startswith("eliminate"):
         handle_eliminated_command(event, say, client)
-    elif "assassin alive" in command_text:
+    elif command_part == "assassin alive":
          handle_assassin_alive_command(event, say)
-    elif "assassin dead" in command_text:
+    elif command_part == "assassin dead":
          handle_assassin_dead_command(event, say)
-    elif "assassin killcount" in command_text:
+    elif command_part == "assassin killcount":
          handle_assassin_killcount_command(event, say)
-    elif "assassin end" in command_text:
+    elif command_part == "assassin end":
          handle_assassin_end_request(event, client, say)
+    elif command_part == "assassin targets": # New admin command
+         handle_assassin_targets_command(event, client)
+    elif command_part == "assassin help": # New help command
+         handle_assassin_help_command(event, say)
     # Existing Spot Bot commands via mention
-    elif "explode" in command_text:
+    elif command_part.startswith("explode"):
         handle_explode_command(event, say, client)
-    elif "mystats" in command_text:
+    elif command_part == "mystats":
         handle_mystats_command(event, say)
-    elif "miss" in command_text:
+    elif command_part.startswith("miss"): # Matches "miss you", "miss u" etc.
         handle_miss_you_command(event, say)
-    elif "alltimecaughtboard" in command_text or "all time caught board" in command_text:
+    elif command_part == "alltimecaughtboard" or command_part == "all time caught board":
         handle_alltime_caughtboard_command(event, say)
-    elif "alltimespotboard" in command_text or "all time spot board" in command_text:
+    elif command_part == "alltimespotboard" or command_part == "all time spot board":
         handle_alltime_spotboard_command(event, say)
-    elif "caughtboard" in command_text:
+    elif command_part == "caughtboard":
         handle_caughtboard_command(event, say)
-    elif "spotboard" in command_text:
+    elif command_part == "spotboard":
         handle_spotboard_command(event, say)
-    elif "test bonus" in command_text:
+    elif command_part == "test bonus":
         say("Sure, I'll run the daily bonus job for you right now. Check the channel for an announcement if it's eligible.")
         daily_bonus_job()
-    else:
-        say(f"Hi there, <@{event['user']}>! Try one of our leaderboard commands: `spotboard`, `caughtboard`, `alltimespotboard`, or `alltimecaughtboard`.")
+    elif command_part == "help" or command_part == "": # Check for just "help" or only the mention
+        handle_spot_help_command(event, say)
+    else: # Default fallback if no other command matches
+        handle_spot_help_command(event, say) # Show general help by default
 
 
 # --- Main Application Execution ---
